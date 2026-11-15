@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wsl-drive-toolbox"
+version = "0.1.0"
+description = "Chinese Windows GUI for WSL proxy setup and external-drive safe ejection"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "WSL Drive Toolbox contributors"}]
+dependencies = []
+
+[project.optional-dependencies]
+build = ["pyinstaller>=6,<7; sys_platform == 'win32'"]
+
+[tool.setuptools.packages.find]
+include = ["toolbox*"]

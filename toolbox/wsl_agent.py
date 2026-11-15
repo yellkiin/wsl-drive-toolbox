@@ -1,0 +1,450 @@
+#!/usr/bin/env python3
+"""Standalone WSL payload. JSON request in argv, JSON response on stdout.
+
+The Windows controller sends this file to ``python3 -``; no package imports or
+Windows paths are needed inside Linux. All configuration belongs to this user.
+"""
+from contextlib import contextmanager
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+import shlex
+import socket
+import ssl
+import subprocess
+import sys
+import tempfile
+import time
+from urllib.parse import urlsplit
+
+
+KEYS = ('http_proxy', 'https_proxy', 'HTTP_PROXY', 'HTTPS_PROXY', 'all_proxy', 'ALL_PROXY')
+START = '# >>> WSL Drive Toolbox >>>'
+END = '# <<< WSL Drive Toolbox <<<'
+SHELL_MARK = '# Managed by WSL Drive Toolbox.'
+SHELL_FILES = ('.bashrc', '.profile', '.zshrc', '.zprofile')
+LEGACY_MARKERS = ('# Managed by the desktop WSL Proxy Switcher.',
+                  '# WSL Proxy Switcher: disabled for newly opened shells.')
+
+
+def digest(data):
+    return None if data is None else hashlib.sha256(data).hexdigest()
+
+
+def read(path):
+    return path.read_bytes() if path.exists() else None
+
+
+def atomic_write(path, data):
+    """Replace one file in its own directory, retaining its original mode."""
+    if data is None:
+        path.unlink(missing_ok=True)
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    mode = path.stat().st_mode & 0o777 if path.exists() else 0o600
+    fd, name = tempfile.mkstemp(prefix='.wsl-toolbox-', dir=path.parent)
+    try:
+        with os.fdopen(fd, 'wb') as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(name, mode)
+        os.replace(name, path)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+
+
+def validate_url(value):
+    if value is None:
+        return
+    parsed = urlsplit(value)
+    if (parsed.scheme != 'http' or not parsed.hostname or not parsed.port or
+            parsed.username or parsed.password or parsed.path or parsed.query or parsed.fragment):
+        raise ValueError('代理地址必须为不含认证信息的 http://主机:端口。')
+    if not re.fullmatch(r'[A-Za-z0-9.:-]+', parsed.hostname):
+        raise ValueError('代理主机地址无效。')
+
+
+def shell_content(url):
+    if url is None:
+        return (SHELL_MARK + '\nunset ' + ' '.join(KEYS) + '\n').encode()
+    lines = [SHELL_MARK] + ['export ' + key + '=' + shlex.quote(url) for key in KEYS]
+    lines += ['export no_proxy="${no_proxy:-${NO_PROXY:-localhost,127.0.0.1,::1,[::1]}}"',
+              'export NO_PROXY="$no_proxy"']
+    return ('\n'.join(lines) + '\n').encode()
+
+
+def managed_block(data):
+    text = (data or b'').decode('utf-8')
+    newline = '\r\n' if '\r\n' in text else '\n'
+    block = newline.join((START, '[ ! -f "$HOME/.config/wsl-drive-toolbox/proxy.sh" ] || . "$HOME/.config/wsl-drive-toolbox/proxy.sh"', END))
+    if text.count(START) != text.count(END) or text.count(START) > 1:
+        raise RuntimeError('shell 管理区块不完整，未覆盖原文件。')
+    if START in text:
+        begin, end = text.index(START), text.index(END) + len(END)
+        if text.index(END) < begin:
+            raise RuntimeError('shell 管理区块顺序不正确，未覆盖原文件。')
+        return (text[:begin] + block + text[end:]).encode('utf-8')
+    return (text + (newline if text and not text.endswith('\n') else '') + block + newline).encode('utf-8')
+
+
+def edit_env(data, url):
+    text = (data or b'').decode('utf-8')
+    newline = '\r\n' if '\r\n' in text else '\n'
+    pattern = re.compile(r'^\s*(?:export\s+)?(' + '|'.join(KEYS) + r')\s*=')
+    lines, seen = [], set()
+    for line in text.splitlines(keepends=True):
+        match = pattern.match(line)
+        if match:
+            key = match.group(1)
+            if key not in seen:
+                lines.append(key + '=' + (url or '') + newline)
+                seen.add(key)
+        else:
+            lines.append(line)
+    result = ''.join(lines)
+    if result and not result.endswith('\n'):
+        result += newline
+    result += ''.join(key + '=' + (url or '') + newline for key in KEYS if key not in seen)
+    return result.encode('utf-8')
+
+
+def migrate_legacy(data, legacy):
+    text = (data or b'').decode('utf-8')
+    if '7897.sh' not in text:
+        return data
+    content = (legacy or b'').decode('utf-8')
+    known = content.startswith(LEGACY_MARKERS) and all(
+        not line.strip() or line.lstrip().startswith(('#', 'export ', 'unset '))
+        for line in content.splitlines())
+    if not known:
+        raise RuntimeError('启动文件引用了未知的旧 7897.sh；请手动处理该引用后重试，原文件未更改。')
+    # Replace only the sourcing command, retaining surrounding if/&& syntax.
+    source = re.compile(r'''(?:source|\.)\s+["']?(?:\$\{HOME\}|\$HOME|~)/\.config/proxy/7897\.sh["']?''')
+    lines = []
+    for line in text.splitlines(keepends=True):
+        if '7897.sh' in line and not line.lstrip().startswith('#'):
+            line, count = source.subn(':', line)
+            if not count and re.search(r'(?:source|\.)\s', line):
+                raise RuntimeError('无法识别旧代理的 source 语句，请先手动处理。')
+        lines.append(line)
+    return ''.join(lines).encode()
+
+
+class Manager:
+    def __init__(self, home):
+        self.home = Path(home).absolute()
+        self.state = self.home / '.local/state/wsl-drive-toolbox'
+        self.backups = self.state / 'backups'
+        self.shell = self.home / '.config/wsl-drive-toolbox/proxy.sh'
+
+    def check_paths(self, paths):
+        for path in paths:
+            if '..' in path.parts or (path != self.home and self.home not in path.parents):
+                raise RuntimeError('配置路径超出当前用户 HOME。')
+            for part in (path, *path.parents):
+                if part.is_symlink():
+                    raise RuntimeError('配置路径含符号链接，未写入：' + str(part))
+                if part == self.home:
+                    break
+            if path.exists() and not path.is_file():
+                raise RuntimeError('配置目标不是普通文件：' + str(path))
+
+    @contextmanager
+    def lock(self):
+        lockpath = self.state / 'transaction.lock'
+        self.check_paths([lockpath, self.backups / '.check'])
+        self.state.mkdir(parents=True, exist_ok=True)
+        with open(lockpath, 'a+b') as handle:
+            try:
+                if os.name == 'nt':
+                    import msvcrt
+                    if handle.tell() == 0:
+                        handle.write(b'0')
+                        handle.flush()
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as error:
+                raise RuntimeError('另一个配置操作正在进行，请稍后重试。') from error
+            try:
+                yield
+            finally:
+                if os.name == 'nt':
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+
+    def transactions(self):
+        return sorted(self.backups.glob('*/manifest.json')) if self.backups.exists() else []
+
+    def apply(self, url, codex=False, verify=True):
+        validate_url(url)
+        with self.lock():
+            for path in self.transactions():
+                if json.loads(path.read_text())['status'] in ('prepared', 'recovery_required'):
+                    raise RuntimeError('存在中断的配置事务；请先使用“回滚上次配置”。')
+            files = [self.home / item for item in SHELL_FILES]
+            files += [self.home / item for item in ('.bash_profile', '.bash_login') if (self.home / item).exists()]
+            legacy = self.home / '.config/proxy/7897.sh'
+            targets = files + [self.shell] + ([self.home / '.codex/.env'] if codex else [])
+            self.check_paths(targets + [legacy])
+            before = {path: read(path) for path in targets}
+            if before[self.shell] and not before[self.shell].startswith(SHELL_MARK.encode()):
+                raise RuntimeError('代理管理文件含未知内容，未覆盖。')
+            desired = {path: managed_block(migrate_legacy(before[path], read(legacy))) for path in files}
+            desired[self.shell] = shell_content(url)
+            if codex:
+                env = self.home / '.codex/.env'
+                desired[env] = edit_env(before[env], url)
+            if desired == before:
+                if verify:
+                    verify_environment(self.home, url)
+                return {'message': '配置已经相同；新 shell 环境已验证。' if verify else '配置已经相同。'}
+            self.backups.mkdir(parents=True, exist_ok=True)
+            folder = self.backups / (str(time.time_ns()) + '-' + secrets.token_hex(3))
+            folder.mkdir(mode=0o700)
+            entries = []
+            for index, (path, data) in enumerate(before.items()):
+                backup = str(index) + '.bak'
+                if data is not None:
+                    atomic_write(folder / backup, data)
+                entries.append(dict(path=path.relative_to(self.home).as_posix(), backup=backup,
+                                    before=digest(data), after=digest(desired[path])))
+            manifest = dict(status='prepared', entries=entries)
+            manifest_path = folder / 'manifest.json'
+            self.save_manifest(manifest_path, manifest)
+            changed = []
+            try:
+                for path, data in desired.items():
+                    if read(path) != before[path]:
+                        raise RuntimeError('配置被其他程序修改，停止覆盖。')
+                    if data != before[path]:
+                        atomic_write(path, data)
+                        changed.append(path)
+                if any(read(path) != data for path, data in desired.items()):
+                    raise RuntimeError('配置写入后校验失败。')
+                if verify:
+                    verify_environment(self.home, url)
+                manifest['status'] = 'applied'
+                self.save_manifest(manifest_path, manifest)
+            except Exception:
+                complete = True
+                for path in reversed(changed):
+                    try:
+                        if read(path) != desired[path]:
+                            complete = False
+                            continue
+                        atomic_write(path, before[path])
+                    except OSError:
+                        complete = False
+                manifest['status'] = 'compensated' if complete else 'recovery_required'
+                self.save_manifest(manifest_path, manifest)
+                raise
+            return {'message': ('显式代理已关闭' if url is None else '代理配置已写入') +
+                    ('，新的登录/交互 shell 环境已验证。' if verify else '。') +
+                    (' Codex .env 已同步；现有进程需要重新启动。' if codex else '')}
+
+    @staticmethod
+    def save_manifest(path, manifest):
+        atomic_write(path, json.dumps(manifest, ensure_ascii=False, indent=2).encode('utf-8'))
+
+    def rollback(self):
+        with self.lock():
+            pending = [(path, json.loads(path.read_text())) for path in reversed(self.transactions())]
+            pending = [(path, state) for path, state in pending if state['status'] in ('applied', 'prepared', 'recovery_required')]
+            if not pending:
+                return {'message': '没有可回滚的配置。'}
+            manifest_path, state = pending[0]
+            restores = {}
+            targets = [self.home / entry['path'] for entry in state['entries']]
+            self.check_paths(targets)
+            for entry, target in zip(state['entries'], targets):
+                backup = manifest_path.parent / entry['backup']
+                if backup.parent != manifest_path.parent or backup.is_symlink():
+                    raise RuntimeError('备份路径无效。')
+                original = read(backup) if entry['before'] is not None else None
+                if digest(original) != entry['before']:
+                    raise RuntimeError('备份校验失败，未恢复任何文件。')
+                current = digest(read(target))
+                allowed = (entry['after'],) if state['status'] == 'applied' else (entry['after'], entry['before'])
+                if current not in allowed:
+                    raise RuntimeError('配置存在外部修改冲突，保留现状，未恢复任何文件。')
+                restores[target] = (read(target), original)
+            # Prepared also makes an interrupted rollback recoverable on the next click.
+            state['status'] = 'prepared'
+            self.save_manifest(manifest_path, state)
+            for target, (expected, original) in restores.items():
+                if read(target) != expected:
+                    raise RuntimeError('回滚时出现外部修改冲突，已停止。')
+                atomic_write(target, original)
+                if read(target) != original:
+                    raise RuntimeError('回滚写后校验失败。')
+            state['status'] = 'restored'
+            self.save_manifest(manifest_path, state)
+            return {'message': '已恢复上次操作前的内容及文件存在状态。现有终端环境不会自动改变。'}
+
+
+def verify_environment(home, url):
+    import pwd
+    shell = pwd.getpwuid(os.getuid()).pw_shell
+    if Path(shell).name not in ('bash', 'zsh'):
+        raise RuntimeError('当前登录 shell 不受支持；自动配置仅支持 Bash 和 Zsh。')
+    if os.environ.get('ZDOTDIR') and Path(os.environ['ZDOTDIR']) != home:
+        raise RuntimeError('检测到自定义 ZDOTDIR，请手动加载代理文件。')
+    command = 'printf "__WSL_TOOLBOX_ENV__"; ' + shlex.quote(sys.executable) + ' -c ' + shlex.quote(
+        'import json,os;print(json.dumps({k:os.environ.get(k, "") for k in ' + repr(KEYS) + '}))')
+    env = dict(os.environ, HOME=str(home))
+    for key in KEYS:
+        env.pop(key, None)
+    for mode in ('-ic', '-lic'):
+        result = subprocess.run([shell, mode, command], env=env, capture_output=True, timeout=12)
+        output = result.stdout.decode('utf-8', 'replace')
+        try:
+            actual = json.loads(output.rsplit('__WSL_TOOLBOX_ENV__', 1)[1].splitlines()[0])
+        except (IndexError, ValueError) as error:
+            raise RuntimeError('无法确认新 shell 的实际代理环境，已撤销此次配置。') from error
+        if result.returncode or any(actual.get(key) != (url or '') for key in KEYS):
+            raise RuntimeError('新 shell 的代理环境被其他配置覆盖，已撤销此次配置。')
+
+
+def probe_http(host, port, echo_port, timeout=2.2):
+    """Verify actual CONNECT forwarding with an unpredictable Windows echo."""
+    end = time.monotonic() + timeout
+    try:
+        with socket.create_connection((host, int(port)), timeout=min(timeout, 1)) as sock:
+            def receive(count):
+                remain = end - time.monotonic()
+                if remain <= 0:
+                    raise TimeoutError('deadline')
+                sock.settimeout(remain)
+                return sock.recv(count)
+            sock.settimeout(max(.01, end - time.monotonic()))
+            sock.sendall(f'CONNECT 127.0.0.1:{int(echo_port)} HTTP/1.1\r\nHost: 127.0.0.1:{int(echo_port)}\r\n\r\n'.encode('ascii'))
+            header = b''
+            while not header.endswith(b'\r\n\r\n'):
+                if len(header) >= 8192:
+                    return False, 'HTTP 响应头过长'
+                part = receive(1)
+                if not part:
+                    return False, 'HTTP CONNECT 响应不完整'
+                header += part
+            first = header.split(b'\r\n', 1)[0]
+            if not re.fullmatch(rb'HTTP/1\.[01] 200(?: .*)?', first):
+                return False, '代理要求认证' if b' 407 ' in first else '不是可用的 HTTP CONNECT 代理'
+            token = ('wsl-toolbox-' + secrets.token_hex(24) + '\n').encode('ascii')
+            sock.sendall(token)
+            echoed = b''
+            while len(echoed) < len(token):
+                part = receive(len(token) - len(echoed))
+                if not part:
+                    break
+                echoed += part
+            return (True, 'WSL HTTP CONNECT 随机回显验证通过') if echoed == token else (False, '回显内容不匹配')
+    except OSError:
+        return False, '无法确认代理：端点不可达、协议不符或规则禁止本地回环'
+
+
+def reachable_hosts():
+    hosts = ['127.0.0.1', '::1']
+    try:
+        result = subprocess.run(['ip', '-j', 'route', 'show', 'default'], capture_output=True, timeout=3, check=True)
+        hosts += [route['gateway'] for route in json.loads(result.stdout) if route.get('gateway')]
+    except (OSError, ValueError, subprocess.SubprocessError):
+        # /proc remains available on minimal distributions without iproute2.
+        try:
+            import struct
+            for line in Path('/proc/net/route').read_text().splitlines()[1:]:
+                parts = line.split()
+                if parts[1] == '00000000':
+                    hosts.append(socket.inet_ntoa(struct.pack('<I', int(parts[2], 16))))
+        except (OSError, ValueError, IndexError):
+            pass
+    return list(dict.fromkeys(hosts))
+
+
+def https_test(url, timeout=12):
+    """User-triggered external test, with normal certificate/hostname validation."""
+    parsed = urlsplit(url)
+    host, port = parsed.hostname, parsed.port
+    end = time.monotonic() + timeout
+    def remaining():
+        value = end - time.monotonic()
+        if value <= 0:
+            raise TimeoutError('HTTPS deadline')
+        return value
+    try:
+        with socket.create_connection((host, port), timeout=remaining()) as conn:
+            conn.settimeout(remaining())
+            conn.sendall(b'CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n')
+            header = b''
+            while not header.endswith(b'\r\n\r\n') and len(header) < 8192:
+                conn.settimeout(remaining())
+                part = conn.recv(1)
+                if not part:
+                    break
+                header += part
+            if not re.match(rb'HTTP/1\.[01] 200(?: |\r)', header):
+                raise OSError('CONNECT failed')
+            context = ssl.create_default_context()
+            conn.settimeout(remaining())
+            with context.wrap_socket(conn, server_hostname='example.com') as secure:
+                secure.settimeout(remaining())
+                secure.sendall(b'HEAD / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n')
+                secure.settimeout(remaining())
+                response = secure.recv(1024)
+                if not response.startswith(b'HTTP/1.'):
+                    raise OSError('invalid HTTPS response')
+        return 'https://example.com 的 TLS/HTTPS 测试通过。'
+    except OSError:
+        return 'https://example.com 的 TLS/HTTPS 测试未通过（证书、节点、规则或网络问题）。'
+
+
+def dispatch(request):
+    action = request['action']
+    manager = Manager(Path.home())
+    if action == 'probe':
+        results = []
+        hosts = reachable_hosts()
+        for candidate in request['candidates']:
+            address = candidate.get('address', candidate.get('host', '127.0.0.1'))
+            if address == '0.0.0.0':
+                order = [host for host in hosts if ':' not in host]
+            elif address == '::':
+                order = hosts
+            else:
+                order = [address]
+            failures = []
+            for host in order:
+                ok, reason = probe_http(host, candidate['port'], request['echo_port'])
+                if ok:
+                    results.append(dict(candidate, host=host, verified=True))
+                    break
+                failures.append(reason)
+            else:
+                results.append(dict(candidate, verified=False, reason=failures[-1]))
+        return {'results': results, 'hosts': hosts}
+    if action == 'apply':
+        return manager.apply(request.get('url'), codex=request.get('codex', False))
+    if action == 'rollback':
+        return manager.rollback()
+    if action == 'https':
+        return {'message': https_test(request['url'])}
+    if action == 'status':
+        content = read(manager.shell)
+        return {'message': '当前用户已有工具管理的代理文件。' if content else '当前用户尚未配置工具管理的代理。',
+                'configured': bool(content)}
+    raise ValueError('未知的 WSL 操作。')
+
+
+if __name__ == '__main__':
+    try:
+        print(json.dumps(dispatch(json.loads(sys.argv[1])), ensure_ascii=True))
+    except Exception as error:
+        print(json.dumps({'error': str(error)}, ensure_ascii=True))
+        sys.exit(1)
