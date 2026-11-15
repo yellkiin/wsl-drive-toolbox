@@ -1,5 +1,6 @@
 from contextlib import contextmanager
 import socket
+import ssl
 import threading
 import time
 import unittest
@@ -158,7 +159,10 @@ class ProtocolTests(unittest.TestCase):
             self.assertLess(time.monotonic() - started, .25)
 
     def test_external_tls_diagnostic_has_overall_deadline(self):
-        with self.server('tls_timeout') as port:
+        # Windows trust-store initialization is setup, outside the measured I/O budget.
+        context = ssl.create_default_context()
+        with self.server('tls_timeout') as port, \
+             mock.patch('toolbox.wsl_agent.ssl.create_default_context', return_value=context):
             started = time.monotonic()
             result = https_test(f'http://127.0.0.1:{port}', timeout=.05)
             self.assertIn('未通过', result)
