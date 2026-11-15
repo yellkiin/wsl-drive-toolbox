@@ -48,7 +48,7 @@ class ToolboxApp:
 
     def _build(self):
         r = self.root
-        r.title('WSL 与移动硬盘工具箱' + (' · 演示' if self.demo else ''))
+        r.title('WSL 工具箱 · 通用预览' + (' · 演示' if self.demo else ''))
         r.geometry('1120x800')
         r.minsize(1000, 760)
         r.configure(bg=BG)
@@ -83,7 +83,7 @@ class ToolboxApp:
         main.pack(side='left', fill='both', expand=True, padx=30, pady=20)
         self.heading = tk.Label(main, text='连接，一步到位。', bg=BG, fg=INK, font=('Microsoft YaHei UI', 21, 'bold'))
         self.heading.pack(anchor='w')
-        self.subtitle = tk.Label(main, text='自动识别 SakuraCat / Clash Verge，让 WSL 使用正确的代理。', bg=BG, fg=MUTED)
+        self.subtitle = tk.Label(main, text='发现 HTTP / HTTPS / SOCKS5 代理，通过固定入口连接 WSL。', bg=BG, fg=MUTED)
         self.subtitle.pack(anchor='w', pady=(7, 14))
         self.container = tk.Frame(main, bg=BG)
         self.pages = {k: tk.Frame(self.container, bg=BG) for k in ('proxy', 'disk')}
@@ -119,7 +119,7 @@ class ToolboxApp:
     def _proxy_page(self, parent):
         card = self.card(parent)
         tk.Label(card, text='工作环境', bg='white', fg=INK, font=('Microsoft YaHei UI', 11, 'bold')).grid(row=0, column=0, sticky='w', columnspan=4, pady=(0, 13))
-        for col, text in [(0, 'WSL 发行版'), (1, 'Linux 用户'), (2, '代理来源')]:
+        for col, text in [(0, 'WSL 发行版'), (1, 'Linux 用户'), (2, '按程序筛选')]:
             tk.Label(card, text=text, bg='white', fg=MUTED, font=('Microsoft YaHei UI', 9)).grid(row=1, column=col, sticky='w', padx=(0, 12), pady=(0, 5))
         self.distro_combo = self.combo(card, self.distro, width=22)
         self.distro_combo.grid(row=2, column=0, sticky='ew', padx=(0, 12))
@@ -127,7 +127,7 @@ class ToolboxApp:
         self.user_combo = self.combo(card, self.user, width=16)
         self.user_combo.grid(row=2, column=1, sticky='ew', padx=(0, 12))
         self.user_combo.bind('<<ComboboxSelected>>', lambda _: self.target_changed())
-        self.family_combo = self.combo(card, self.family, ['自动选择', 'SakuraCat', 'Clash Verge'], width=17)
+        self.family_combo = self.combo(card, self.family, ['自动选择'], width=17)
         self.family_combo.grid(row=2, column=2, sticky='ew', padx=(0, 12))
         self.family_combo.bind('<<ComboboxSelected>>', lambda _: self.target_changed())
         self.button(card, '刷新', self.refresh_distros).grid(row=0, column=3, sticky='e', pady=(0, 9))
@@ -147,15 +147,15 @@ class ToolboxApp:
         self.button(row, '重新检测', self.scan).pack(side='left', padx=10)
         self.button(row, '打开新终端', self.open_terminal).pack(side='left')
         tk.Label(parent, text='可用代理   ·   检测后可点选一行，指定本次连接', bg=BG, fg=MUTED, font=('Microsoft YaHei UI', 9)).pack(anchor='w', pady=(0, 6))
-        self.proxy_tree = ttk.Treeview(parent, columns=('app', 'endpoint', 'state'), show='headings', height=3, selectmode='browse')
-        for key, title, width in [('app', '代理软件', 170), ('endpoint', 'WSL 可达地址', 220), ('state', '验证结果', 240)]:
+        self.proxy_tree = ttk.Treeview(parent, columns=('app', 'protocol', 'endpoint', 'state'), show='headings', height=3, selectmode='browse')
+        for key, title, width in [('app', '代理程序', 150), ('protocol', '协议', 75), ('endpoint', '上游地址', 205), ('state', '验证结果', 200)]:
             self.proxy_tree.heading(key, text=title)
             self.proxy_tree.column(key, width=width, anchor='w')
         self.proxy_tree.bind('<Button-1>', self._freeze_selection)
         self.proxy_tree.bind('<Key>', self._freeze_selection)
         row = tk.Frame(parent, bg=BG)
         row.pack(side='bottom', fill='x', pady=(14, 0))
-        for title, fn in [('关闭显式代理', self.disable), ('回滚上次配置', self.rollback), ('网络诊断', self.diagnose), ('手动端口', self.manual)]:
+        for title, fn in [('关闭代理', self.disable), ('回滚配置', self.rollback), ('网络诊断', self.diagnose), ('工具联网检查', self.check_apps), ('完整检测', lambda: self.scan(extended=True)), ('手动地址', self.manual)]:
             self.button(row, title, fn).pack(side='left', padx=(0, 9))
         self.proxy_tree.pack(fill='both', expand=True)
 
@@ -194,7 +194,7 @@ class ToolboxApp:
             self.nav[key].configure(bg='#244156' if key == page else NAVY, fg='white' if key == page else '#b6c8d5')
         self.pages[page].pack(fill='both', expand=True)
         self.heading.configure(text='连接，一步到位。' if page == 'proxy' else '拔出之前，交给工具箱。')
-        self.subtitle.configure(text='自动识别 SakuraCat / Clash Verge，让 WSL 使用正确的代理。' if page == 'proxy' else '找到占用，正常关闭，让 Windows 确认安全移除。')
+        self.subtitle.configure(text='发现 HTTP / HTTPS / SOCKS5 代理，通过固定入口连接 WSL。' if page == 'proxy' else '找到占用，正常关闭，让 Windows 确认安全移除。')
         if page == 'disk' and not self.disk_rows and not self.busy:
             self.refresh_disks()
 
@@ -314,26 +314,32 @@ class ToolboxApp:
 
     def _scan_result(self, result):
         self.candidates = result.get('candidates', [])
+        names = sorted({c['app'] for c in self.candidates})
+        self.family_combo['values'] = ['自动选择'] + sorted(set(names + ([self.family.get()] if self.family.get() != '自动选择' else [])))
         selected = result.get('selected')
         reason = result.get('reason', '')
         if self.family.get() != '自动选择':
             self.candidates = [c for c in self.candidates if c['app'] == self.family.get()]
-            selected = self.candidates[0] if len(self.candidates) == 1 else None
+            selected = self.candidates[0] if len(self.candidates) == 1 and self.candidates[0].get('verified', True) else None
             reason = '已筛选 ' + self.family.get() + '；点击连接，或从列表中选择端口。'
         self.proxy_tree.delete(*self.proxy_tree.get_children())
         for i, c in enumerate(self.candidates):
-            self.proxy_tree.insert('', 'end', iid=str(i), values=(c['app'], f"{c['host']}:{c['port']}", '本机代理验证通过'))
+            verified = c.get('verified', True)
+            self.proxy_tree.insert('', 'end', iid=str(i), values=(c['app'], c.get('protocol', 'http').upper(), f"{c['host']}:{c['port']}", '转发验证通过' if verified else '未确认 · 连接时验证'))
             if c == selected:
                 self.proxy_tree.selection_set(str(i))
-        self.proxy_status.set(f'发现 {len(self.candidates)} 个可用代理' if self.candidates else '没有找到可确认的代理')
+        self.proxy_status.set(f'发现 {len(self.candidates)} 个代理候选' if self.candidates else '没有找到可确认的代理')
         self.proxy_detail.set(reason or '选中一行后点击「一键连接 WSL」。')
         for issue in result.get('issues', []):
             self._log(str(issue))
+        coverage = result.get('coverage')
+        if coverage:
+            self._log(f"已检测 {coverage.get('completed', 0)} / {coverage.get('total', 0)} 个监听端点；未完成 {coverage.get('pending', 0)}。")
 
-    def scan(self):
+    def scan(self, extended=False):
         target = self.target()
         if target:
-            self.run('检测实际代理端口', lambda: self.proxy.scan(*target), self._scan_result)
+            self.run('完整检测本机监听代理' if extended else '检测实际代理端口', lambda: self.proxy.scan(*target, extended=extended), self._scan_result)
 
     def connect(self, candidate=None):
         target = self.target()
@@ -348,8 +354,13 @@ class ToolboxApp:
 
     def _connected(self, result):
         c = result.get('candidate')
-        self.proxy_status.set('WSL 代理已配置')
-        self.proxy_detail.set((f"{c['app']}  ·  {c['host']}:{c['port']}\n" if c else '') + result.get('message', '请打开新终端加载代理。'))
+        network = result.get('network') or {}
+        self.proxy_status.set('WSL 入口已配置 · 外网验证通过' if network.get('ok') else 'WSL 入口已配置 · 请查看网络结果')
+        lines = ['应用入口：' + result['local_url']] if result.get('local_url') else []
+        if c:
+            lines.append(f"上游：{c['app']} · {c.get('protocol', 'http').upper()} · {c['host']}:{c['port']}")
+        lines.append(network.get('message') or result.get('message', '请打开新终端加载代理。'))
+        self.proxy_detail.set('\n'.join(lines))
         self._log(result.get('message', '已完成'))
         self.candidates = []
         self.proxy_tree.delete(*self.proxy_tree.get_children())
@@ -382,9 +393,41 @@ class ToolboxApp:
         self._log(result.get('message', ''))
 
     def manual(self):
-        port = simpledialog.askinteger('手动 HTTP / 混合端口', '输入代理软件当前的 HTTP 或混合端口：', parent=self.root, minvalue=1, maxvalue=65535)
-        if port:
-            self.connect({'app': '手动', 'host': '127.0.0.1', 'port': port})
+        address = simpledialog.askstring('手动代理地址', '输入 http://主机:端口、https://主机:端口 或 socks5://主机:端口。\n也可只输入本机端口。此预览版不接收账号密码。', parent=self.root)
+        if not address:
+            return
+        address = address.strip()
+        self.family.set('自动选择')
+        if address.isdigit():
+            self.connect({'app': '手动', 'host': '127.0.0.1', 'port': int(address), 'protocol': 'auto'})
+        else:
+            self.connect({'app': '手动', 'host': address if '://' in address else 'http://' + address, 'protocol': 'auto'})
+
+    def check_apps(self):
+        target = self.target()
+        if target:
+            self.proxy_detail.set('只读查询公开站点，检查 curl / Git / pip / npm / Node；Codex 仅检查版本和代理覆盖。')
+            self.run('验证常用工具的实际联网路径（可能需要一分钟）', lambda: self.proxy.check_apps(*target), self._app_checks_result)
+
+    def _app_checks_result(self, result):
+        self.proxy_status.set('应用联网检查完成')
+        self.proxy_detail.set(result.get('message', ''))
+        window = tk.Toplevel(self.root)
+        window.title('工具联网检查 · 通用预览')
+        window.geometry('820x620')
+        body = tk.Text(window, wrap='word', padx=20, pady=16, font=('Microsoft YaHei UI', 10), bg='white', fg=INK)
+        scrollbar = ttk.Scrollbar(window, command=body.yview)
+        scrollbar.pack(side='right', fill='y')
+        body.configure(yscrollcommand=scrollbar.set)
+        body.pack(fill='both', expand=True)
+        labels = {'ok':'请求成功并观察到代理连接', 'bypass':'已联网，路径未确认', 'failed':'未通过', 'not_installed':'未安装', 'configuration':'配置检查'}
+        body.insert('end', result.get('message', '') + '\n\n')
+        for row in result.get('tools', []):
+            body.insert('end', row['name'] + ' — ' + labels.get(row['status'], row['status']) + '\n' + row['detail'] + '\n\n')
+        if result.get('warnings'):
+            body.insert('end', '需要核对的独立配置\n' + '\n'.join(result['warnings']))
+        body.configure(state='disabled')
+        self._log(result.get('message', ''))
 
     def open_terminal(self):
         target = self.target()

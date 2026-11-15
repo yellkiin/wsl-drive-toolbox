@@ -179,7 +179,7 @@ class ConfigurationTests(unittest.TestCase):
 
     def test_loopback_binding_does_not_probe_other_process_on_gateway(self):
         attempted = []
-        def probe(host, port, echo_port):
+        def probe(host, port, echo_port, timeout=2.2):
             attempted.append(host)
             return host == '172.20.0.1', 'test probe'
         with mock.patch.object(agent, 'reachable_hosts', return_value=['127.0.0.1', '172.20.0.1']), \
@@ -190,7 +190,7 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(attempted, ['127.0.0.1'])
 
     def test_wildcard_binding_can_use_nat_gateway(self):
-        def probe(host, port, echo_port):
+        def probe(host, port, echo_port, timeout=2.2):
             return host == '172.20.0.1', 'test probe'
         with mock.patch.object(agent, 'reachable_hosts', return_value=['127.0.0.1', '::1', '172.20.0.1']), \
              mock.patch.object(agent, 'probe_http', side_effect=probe):
@@ -200,7 +200,7 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(result['results'][0]['host'], '172.20.0.1')
 
     def test_windows_ipv6_wildcard_can_be_dualstack(self):
-        def probe(host, port, echo_port):
+        def probe(host, port, echo_port, timeout=2.2):
             return host == '172.20.0.1', 'test probe'
         with mock.patch.object(agent, 'reachable_hosts', return_value=['127.0.0.1', '::1', '172.20.0.1']), \
              mock.patch.object(agent, 'probe_http', side_effect=probe):
@@ -212,3 +212,116 @@ class ConfigurationTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+class GatewayTransactionTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp.name)
+        self.manager = agent.Manager(self.home)
+        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(lambda: agent.gateway.stop(self.home))
+
+    def connect(self):
+        plan = agent.gateway.prepare(self.home, dict(host='127.0.0.1', port=19000, protocol='http'))
+        self.manager.apply(plan['url'], verify=False, extra_files=plan['files'], gateway_mode=True)
+        return plan
+
+    def test_gateway_files_shell_and_process_rollback_together(self):
+        self.connect()
+        self.assertTrue(agent.gateway.status(self.home)['running'])
+        self.assertIn(b'gateway.py', self.manager.shell.read_bytes())
+        self.manager.rollback()
+        self.assertFalse(agent.gateway.status(self.home)['running'])
+        self.assertFalse((self.home / agent.gateway.CONFIG).exists())
+
+    def test_gateway_off_and_rollback_restart_same_entry(self):
+        plan = self.connect()
+        self.manager.apply(None, verify=False)
+        self.assertFalse(agent.gateway.status(self.home)['running'])
+        self.manager.rollback()
+        self.assertTrue(agent.gateway.status(self.home)['running'])
+        self.assertEqual(agent.gateway.status(self.home)['url'], plan['url'])
+
+    def test_failed_gateway_verification_restores_helper_and_process(self):
+        plan = agent.gateway.prepare(self.home, dict(host='127.0.0.1', port=19000, protocol='http'))
+        with mock.patch.object(agent, 'verify_environment', side_effect=RuntimeError('verify failed')):
+            with self.assertRaisesRegex(RuntimeError, 'verify failed'):
+                self.manager.apply(plan['url'], extra_files=plan['files'], gateway_mode=True)
+        self.assertFalse(agent.gateway.status(self.home)['running'])
+        self.assertFalse((self.home / agent.gateway.CONFIG).exists())
+    def test_failed_connect_preserves_working_upstream_and_daemon(self):
+        self.connect()
+        before = (self.home / agent.gateway.CONFIG).read_bytes()
+        with mock.patch.object(Path, 'home', return_value=self.home), \
+             mock.patch.object(agent, 'verify_environment'), \
+             mock.patch.object(agent, 'network_test', return_value=dict(ok=False, reason='dead upstream', message='dead upstream')):
+            with self.assertRaisesRegex(RuntimeError, 'dead upstream'):
+                agent.dispatch(dict(action='connect_gateway', upstream=dict(host='127.0.0.1', port=19999, protocol='http')))
+        self.assertEqual((self.home / agent.gateway.CONFIG).read_bytes(), before)
+        self.assertTrue(agent.gateway.status(self.home)['running'])
+
+    def test_failed_first_connect_removes_new_service_and_files(self):
+        with mock.patch.object(Path, 'home', return_value=self.home), \
+             mock.patch.object(agent, 'verify_environment'), \
+             mock.patch.object(agent, 'network_test', return_value=dict(ok=False, reason='dead upstream', message='dead upstream')):
+            with self.assertRaisesRegex(RuntimeError, 'dead upstream'):
+                agent.dispatch(dict(action='connect_gateway', upstream=dict(host='127.0.0.1', port=19999, protocol='http')))
+        self.assertFalse((self.home / agent.gateway.CONFIG).exists())
+        self.assertFalse(agent.gateway.status(self.home)['running'])
+
+
+class UniversalProbeTests(unittest.TestCase):
+    def test_auto_detects_socks_with_local_nonce_echo(self):
+        from tests.test_gateway import Fixture, SocksProxy
+        proxy = Fixture(SocksProxy)
+        self.addCleanup(proxy.close)
+        result = agent.dispatch(dict(action='probe', echo_port=23456, candidates=[
+            dict(address='127.0.0.1', port=proxy.port, protocol='auto')]))
+        self.assertTrue(result['results'][0]['verified'])
+        self.assertEqual(result['results'][0]['protocol'], 'socks5')
+        self.assertEqual(result['coverage']['completed'], 1)
+
+    def test_external_fallback_requires_explicit_system_or_manual_source(self):
+        candidates = [dict(address='127.0.0.1', port=12345, protocol='http', source='listener'),
+                      dict(address='127.0.0.1', port=12345, protocol='http', source='system')]
+        with mock.patch.object(agent, 'probe_http', return_value=(False, 'loopback forbidden')), \
+             mock.patch.object(agent, 'network_test', return_value=dict(ok=True, reason='TLS verified')) as network:
+            result = agent.dispatch(dict(action='probe', echo_port=23456, candidates=candidates, allow_external=True))
+        self.assertFalse(result['results'][0]['verified'])
+        self.assertTrue(result['results'][1]['verified'])
+        self.assertEqual(network.call_count, 1)
+
+    def test_budget_reports_pending_candidates(self):
+        result = agent.dispatch(dict(action='probe', echo_port=23456, budget=0, candidates=[
+            dict(address='127.0.0.1', port=12345, protocol='auto')]))
+        self.assertEqual(result['coverage']['pending'], 1)
+        self.assertFalse(result['results'][0]['verified'])
+
+
+class LinuxGatewayShellSmoke(unittest.TestCase):
+    @unittest.skipUnless(os.name == 'posix' and shutil.which('bash') and shutil.which('curl'), 'Requires Linux Bash and curl')
+    def test_new_bash_restarts_helper_and_real_curl_uses_stable_entry(self):
+        from tests.test_gateway import Fixture, HttpProxy
+        proxy = Fixture(HttpProxy)
+        proxy.server.requests, proxy.server.label = [], b'isolated shell gateway'
+        self.addCleanup(proxy.close)
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            plan = agent.gateway.prepare(home, dict(host='127.0.0.1', port=proxy.port, protocol='http'))
+            env = dict(os.environ, HOME=str(home), ZDOTDIR='', no_proxy='', NO_PROXY='')
+            try:
+                with mock.patch.dict(os.environ, env):
+                    manager = agent.Manager(home)
+                    manager.apply(plan['url'], extra_files=plan['files'], gateway_mode=True)
+                    agent.gateway.stop(home)
+                    result = subprocess.run(['bash', '-ic', 'printf __TOOLBOX_CURL__; curl -fsS --max-time 4 http://origin.invalid/isolated'],
+                                            env=env, capture_output=True, timeout=8)
+                    self.assertEqual(result.returncode, 0, result.stderr.decode('utf-8', 'replace'))
+                    self.assertEqual(result.stdout.rsplit(b'__TOOLBOX_CURL__', 1)[1], b'isolated shell gateway')
+                    self.assertTrue(agent.gateway.status(home)['running'])
+                    self.assertEqual(agent.gateway.status(home)['url'], plan['url'])
+                    self.assertEqual(agent.gateway.status(home)['counts']['origin.invalid'], 1)
+                    manager.rollback()
+                    self.assertFalse(agent.gateway.status(home)['running'])
+            finally:
+                agent.gateway.stop(home)

@@ -1,9 +1,10 @@
 import os
 import sys
 import unittest
+import importlib.util
 from unittest.mock import patch
 
-@unittest.skipUnless(sys.platform == 'win32' or os.environ.get('DISPLAY'), 'GUI needs a desktop')
+@unittest.skipUnless(importlib.util.find_spec('tkinter') and (sys.platform == 'win32' or os.environ.get('DISPLAY')), 'GUI needs Tk and a desktop')
 class AppTests(unittest.TestCase):
     def setUp(self):
         import tkinter as tk
@@ -19,7 +20,7 @@ class AppTests(unittest.TestCase):
         self.assertTrue(self.app.progress.winfo_ismapped())
         self.assertLess(self.app.progress.winfo_rooty(), self.root.winfo_rooty() + self.root.winfo_height())
         for control, _ in self.app.controls:
-            if str(control.cget('text')) == '手动端口':
+            if str(control.cget('text')) == '手动地址':
                 self.assertTrue(control.winfo_ismapped(), 'proxy secondary actions must remain visible')
 
     def test_cancel_close_dialog_does_not_start_disk_action(self):
@@ -51,3 +52,10 @@ class AppTests(unittest.TestCase):
         bounds = self.app.proxy_tree.bbox('0')
         self.assertTrue(bounds, 'first candidate must be visible')
         self.assertLessEqual(bounds[1] + bounds[3], self.app.proxy_tree.winfo_height())
+
+    def test_unknown_process_is_selectable_and_unverified_row_not_labeled_passed(self):
+        row = {'app':'AnyProxy','host':'proxy.example','port':8080,'protocol':'http','verified':False,'source':'system'}
+        self.app._scan_result({'candidates':[row], 'selected':None, 'reason':'待验证', 'issues':[]})
+        self.assertIn('AnyProxy', self.app.family_combo['values'])
+        self.assertIn('未确认', str(self.app.proxy_tree.item('0')['values']))
+        self.assertFalse(self.app.proxy_tree.selection())

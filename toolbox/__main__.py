@@ -8,10 +8,11 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description='WSL 与移动硬盘工具箱')
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument('--demo', action='store_true', help='使用演示数据打开界面，不操作系统')
-    mode.add_argument('--cli', choices=['status', 'scan', 'connect', 'off', 'rollback', 'diagnose'])
+    mode.add_argument('--cli', choices=['status', 'scan', 'connect', 'off', 'rollback', 'diagnose', 'apps'])
     parser.add_argument('--distro')
     parser.add_argument('--user')
-    parser.add_argument('--family', choices=['SakuraCat', 'Clash Verge'])
+    parser.add_argument('--family', help='按检测到的程序标签筛选（可选）')
+    parser.add_argument('--extended', action='store_true', help='扫描全部本机 TCP 监听端点')
     parser.add_argument('--codex', action='store_true')
     args = parser.parse_args(argv)
     if not args.cli:
@@ -30,6 +31,10 @@ def main(argv=None):
                 result = proxy.connect(*target, family=args.family, codex=args.codex)
             elif args.cli == 'off':
                 result = proxy.disable(*target, codex=args.codex)
+            elif args.cli == 'scan':
+                result = proxy.scan(*target, extended=args.extended)
+            elif args.cli == 'apps':
+                result = proxy.check_apps(*target)
             else:
                 result = getattr(proxy, args.cli)(*target)
         print(json.dumps(result, ensure_ascii=False, indent=2))
