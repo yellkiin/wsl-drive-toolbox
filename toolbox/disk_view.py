@@ -21,7 +21,7 @@ def inspection_text(info):
         lines.append('{0}  ·  PID {1}  ·  匹配句柄 {2}'.format(process['name'], process['pid'], process.get('handle_count', 0)))
         for evidence in process.get('evidence', [])[:6]:
             source = {'handle':'打开的对象', 'image':'运行位置', 'restart_manager':'系统资源关联'}.get(evidence.get('source'), '关联证据')
-            lines.append('  ' + source + '：' + evidence.get('path', evidence.get('kind', '已确认'))) 
+            lines.append('  ' + source + '：' + evidence.get('path', evidence.get('kind', '已确认')))
         if process.get('close_reason'):
             lines.append('  ' + process['close_reason'])
     services = info.get('services', [])
