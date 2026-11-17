@@ -5,6 +5,7 @@ The Windows controller sends this file to ``python3 -``; no package imports or
 Windows paths are needed inside Linux. All configuration belongs to this user.
 """
 from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor, wait
 import hashlib
 import json
 import os
@@ -19,6 +20,12 @@ import sys
 import tempfile
 import time
 from urllib.parse import urlsplit
+
+
+try:
+    from . import gateway
+except ImportError:
+    gateway = sys.modules.get('toolbox_gateway')
 
 
 KEYS = ('http_proxy', 'https_proxy', 'HTTP_PROXY', 'HTTPS_PROXY', 'all_proxy', 'ALL_PROXY')
@@ -69,10 +76,13 @@ def validate_url(value):
         raise ValueError('代理主机地址无效。')
 
 
-def shell_content(url):
+def shell_content(url, gateway_mode=False):
     if url is None:
         return (SHELL_MARK + '\nunset ' + ' '.join(KEYS) + '\n').encode()
-    lines = [SHELL_MARK] + ['export ' + key + '=' + shlex.quote(url) for key in KEYS]
+    lines = [SHELL_MARK]
+    if gateway_mode:
+        lines += ['export NODE_USE_ENV_PROXY=1', 'python3 "$HOME/.local/lib/wsl-drive-toolbox/gateway.py" ensure "$HOME" || return 1']
+    lines += ['export ' + key + '=' + shlex.quote(url) for key in KEYS]
     lines += ['export no_proxy="${no_proxy:-${NO_PROXY:-localhost,127.0.0.1,::1,[::1]}}"',
               'export NO_PROXY="$no_proxy"']
     return ('\n'.join(lines) + '\n').encode()
@@ -183,26 +193,37 @@ class Manager:
     def transactions(self):
         return sorted(self.backups.glob('*/manifest.json')) if self.backups.exists() else []
 
-    def apply(self, url, codex=False, verify=True):
+    def apply(self, url, codex=False, verify=True, extra_files=None, gateway_mode=False, verify_connection=None):
         validate_url(url)
         with self.lock():
             for path in self.transactions():
                 if json.loads(path.read_text())['status'] in ('prepared', 'recovery_required'):
                     raise RuntimeError('存在中断的配置事务；请先使用“回滚上次配置”。')
+            previous_gateway = gateway.load_config(self.home) if gateway else None
+            extra_files = dict(extra_files or {})
+            if previous_gateway and not gateway_mode:
+                disabled = dict(previous_gateway, enabled=False)
+                extra_files[self.home / gateway.CONFIG] = json.dumps(disabled, indent=2).encode()
             files = [self.home / item for item in SHELL_FILES]
             files += [self.home / item for item in ('.bash_profile', '.bash_login') if (self.home / item).exists()]
             legacy = self.home / '.config/proxy/7897.sh'
             targets = files + [self.shell] + ([self.home / '.codex/.env'] if codex else [])
+            targets += list(extra_files)
             self.check_paths(targets + [legacy])
             before = {path: read(path) for path in targets}
             if before[self.shell] and not before[self.shell].startswith(SHELL_MARK.encode()):
                 raise RuntimeError('代理管理文件含未知内容，未覆盖。')
             desired = {path: managed_block(migrate_legacy(before[path], read(legacy))) for path in files}
-            desired[self.shell] = shell_content(url)
+            desired[self.shell] = shell_content(url, gateway_mode)
+            desired.update(extra_files)
             if codex:
                 env = self.home / '.codex/.env'
                 desired[env] = edit_env(before[env], url)
             if desired == before:
+                if gateway:
+                    gateway.reconcile(self.home, previous_gateway)
+                if verify_connection:
+                    verify_connection()
                 if verify:
                     verify_environment(self.home, url)
                 return {'message': '配置已经相同；新 shell 环境已验证。' if verify else '配置已经相同。'}
@@ -220,6 +241,7 @@ class Manager:
             manifest_path = folder / 'manifest.json'
             self.save_manifest(manifest_path, manifest)
             changed = []
+            attempted_gateway = json.loads(extra_files[self.home / gateway.CONFIG]) if gateway and self.home / gateway.CONFIG in extra_files else previous_gateway
             try:
                 for path, data in desired.items():
                     if read(path) != before[path]:
@@ -229,6 +251,10 @@ class Manager:
                         changed.append(path)
                 if any(read(path) != data for path, data in desired.items()):
                     raise RuntimeError('配置写入后校验失败。')
+                if gateway:
+                    gateway.reconcile(self.home, previous_gateway)
+                if verify_connection:
+                    verify_connection()
                 if verify:
                     verify_environment(self.home, url)
                 manifest['status'] = 'applied'
@@ -242,6 +268,11 @@ class Manager:
                             continue
                         atomic_write(path, before[path])
                     except OSError:
+                        complete = False
+                if gateway:
+                    try:
+                        gateway.reconcile(self.home, attempted_gateway)
+                    except (OSError, RuntimeError):
                         complete = False
                 manifest['status'] = 'compensated' if complete else 'recovery_required'
                 self.save_manifest(manifest_path, manifest)
@@ -276,6 +307,7 @@ class Manager:
                 if current not in allowed:
                     raise RuntimeError('配置存在外部修改冲突，保留现状，未恢复任何文件。')
                 restores[target] = (read(target), original)
+            previous_gateway = gateway.load_config(self.home) if gateway else None
             # Prepared also makes an interrupted rollback recoverable on the next click.
             state['status'] = 'prepared'
             self.save_manifest(manifest_path, state)
@@ -285,6 +317,8 @@ class Manager:
                 atomic_write(target, original)
                 if read(target) != original:
                     raise RuntimeError('回滚写后校验失败。')
+            if gateway:
+                gateway.reconcile(self.home, previous_gateway)
             state['status'] = 'restored'
             self.save_manifest(manifest_path, state)
             return {'message': '已恢复上次操作前的内容及文件存在状态。现有终端环境不会自动改变。'}
@@ -313,41 +347,25 @@ def verify_environment(home, url):
             raise RuntimeError('新 shell 的代理环境被其他配置覆盖，已撤销此次配置。')
 
 
-def probe_http(host, port, echo_port, timeout=2.2):
-    """Verify actual CONNECT forwarding with an unpredictable Windows echo."""
+def probe_protocol(upstream, echo_port, timeout=2.2):
+    """Validate a local nonce through the actual protocol, without DNS or Internet."""
     end = time.monotonic() + timeout
     try:
-        with socket.create_connection((host, int(port)), timeout=min(timeout, 1)) as sock:
-            def receive(count):
-                remain = end - time.monotonic()
-                if remain <= 0:
-                    raise TimeoutError('deadline')
-                sock.settimeout(remain)
-                return sock.recv(count)
-            sock.settimeout(max(.01, end - time.monotonic()))
-            sock.sendall(f'CONNECT 127.0.0.1:{int(echo_port)} HTTP/1.1\r\nHost: 127.0.0.1:{int(echo_port)}\r\n\r\n'.encode('ascii'))
-            header = b''
-            while not header.endswith(b'\r\n\r\n'):
-                if len(header) >= 8192:
-                    return False, 'HTTP 响应头过长'
-                part = receive(1)
-                if not part:
-                    return False, 'HTTP CONNECT 响应不完整'
-                header += part
-            first = header.split(b'\r\n', 1)[0]
-            if not re.fullmatch(rb'HTTP/1\.[01] 200(?: .*)?', first):
-                return False, '代理要求认证' if b' 407 ' in first else '不是可用的 HTTP CONNECT 代理'
+        with gateway.open_tunnel(upstream, '127.0.0.1', int(echo_port), timeout=timeout) as sock:
             token = ('wsl-toolbox-' + secrets.token_hex(24) + '\n').encode('ascii')
+            sock.settimeout(max(.01, end - time.monotonic()))
             sock.sendall(token)
-            echoed = b''
-            while len(echoed) < len(token):
-                part = receive(len(token) - len(echoed))
-                if not part:
-                    break
-                echoed += part
-            return (True, 'WSL HTTP CONNECT 随机回显验证通过') if echoed == token else (False, '回显内容不匹配')
-    except OSError:
-        return False, '无法确认代理：端点不可达、协议不符或规则禁止本地回环'
+            echoed = gateway.receive_exact(sock, len(token), end)
+            return (True, '本机随机回显验证通过') if echoed == token else (False, '回显内容不匹配')
+    except (OSError, ValueError) as error:
+        reason = str(error)
+        if '认证' in reason or 'CONNECT' in reason:
+            return False, reason
+        return False, '端点不可达、协议不符或规则禁止本地回环'
+
+
+def probe_http(host, port, echo_port, timeout=2.2):
+    return probe_protocol(dict(host=host, port=port, protocol='http'), echo_port, timeout)
 
 
 def reachable_hosts():
@@ -368,67 +386,158 @@ def reachable_hosts():
     return list(dict.fromkeys(hosts))
 
 
-def https_test(url, timeout=12):
-    """User-triggered external test, with normal certificate/hostname validation."""
-    parsed = urlsplit(url)
-    host, port = parsed.hostname, parsed.port
+def tls_get(sock, host, timeout):
+    """TLS over any stream, including an already TLS-encrypted HTTPS proxy."""
+    deadline = time.monotonic() + timeout
+    incoming, outgoing = ssl.MemoryBIO(), ssl.MemoryBIO()
+    tls = ssl.create_default_context().wrap_bio(incoming, outgoing, server_side=False, server_hostname=host)
+
+    def exchange(operation):
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError('HTTPS deadline')
+            sock.settimeout(remaining)
+            try:
+                result = operation()
+            except ssl.SSLWantReadError:
+                pending = outgoing.read()
+                if pending:
+                    sock.sendall(pending)
+                data = sock.recv(65536)
+                if not data:
+                    raise OSError('TLS 连接提前关闭')
+                incoming.write(data)
+                continue
+            pending = outgoing.read()
+            if pending:
+                sock.sendall(pending)
+            return result
+
+    exchange(tls.do_handshake)
+    request = ('GET / HTTP/1.1\r\nHost: ' + host + '\r\nConnection: close\r\n\r\n').encode('ascii')
+    exchange(lambda: tls.write(request))
+    response = b''
+    while b'\r\n' not in response and len(response) < 8192:
+        part = exchange(lambda: tls.read(1024))
+        if not part:
+            raise OSError('HTTPS 响应提前关闭')
+        response += part
+    if not re.match(rb'HTTP/1\.[01] [1-5][0-9][0-9](?: |\r)', response):
+        raise OSError('HTTPS 响应无效')
+
+
+def network_test(upstream, timeout=12):
     end = time.monotonic() + timeout
-    def remaining():
-        value = end - time.monotonic()
-        if value <= 0:
-            raise TimeoutError('HTTPS deadline')
-        return value
     try:
-        with socket.create_connection((host, port), timeout=remaining()) as conn:
-            conn.settimeout(remaining())
-            conn.sendall(b'CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n')
-            header = b''
-            while not header.endswith(b'\r\n\r\n') and len(header) < 8192:
-                conn.settimeout(remaining())
-                part = conn.recv(1)
-                if not part:
-                    break
-                header += part
-            if not re.match(rb'HTTP/1\.[01] 200(?: |\r)', header):
-                raise OSError('CONNECT failed')
-            context = ssl.create_default_context()
-            conn.settimeout(remaining())
-            with context.wrap_socket(conn, server_hostname='example.com') as secure:
-                secure.settimeout(remaining())
-                secure.sendall(b'HEAD / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n')
-                secure.settimeout(remaining())
-                response = secure.recv(1024)
-                if not response.startswith(b'HTTP/1.'):
-                    raise OSError('invalid HTTPS response')
-        return 'https://example.com 的 TLS/HTTPS 测试通过。'
-    except OSError:
-        return 'https://example.com 的 TLS/HTTPS 测试未通过（证书、节点、规则或网络问题）。'
+        with gateway.open_tunnel(upstream, 'example.com', 443, timeout=timeout) as sock:
+            tls_get(sock, 'example.com', max(.01, end - time.monotonic()))
+        return dict(ok=True, reason='https://example.com 的 TLS/HTTPS 测试通过。', message='https://example.com 的 TLS/HTTPS 测试通过。')
+    except (OSError, ValueError) as error:
+        detail = str(error)
+        if isinstance(error, ssl.SSLCertVerificationError):
+            detail = '证书或主机名校验失败'
+        elif not any(word in detail for word in ('认证', 'CONNECT', 'SOCKS5')):
+            detail = '证书、节点、规则或网络问题'
+        message = 'https://example.com 的 TLS/HTTPS 测试未通过（' + detail + '）。'
+        return dict(ok=False, reason=message, message=message)
+
+
+def https_test(url, timeout=12):
+    parsed = urlsplit(url)
+    return network_test(dict(host=parsed.hostname, port=parsed.port, protocol=parsed.scheme), timeout)['reason']
+
+
+def probe_candidates(request):
+    candidates = request['candidates']
+    hosts = reachable_hosts()
+    deadline = time.monotonic() + min(30, max(0, float(request.get('budget', 18))))
+
+    def probe(candidate):
+        address = candidate.get('address', candidate.get('host', '127.0.0.1'))
+        if address == '0.0.0.0':
+            order = [host for host in hosts if ':' not in host]
+        elif address == '::':
+            order = hosts
+        else:
+            order = [address]
+        protocol = candidate.get('protocol', 'http')
+        protocols = ('http', 'socks5', 'https') if protocol == 'auto' else (protocol,)
+        reason = '检测时间预算已用完'
+        for host in order:
+            for protocol in protocols:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return dict(candidate, verified=False, reason=reason, pending=True)
+                upstream = dict(host=host, port=candidate['port'], protocol=protocol)
+                if protocol == 'http':
+                    # Keep the legacy callable for controller compatibility and fixtures.
+                    ok, reason = probe_http(host, candidate['port'], request['echo_port'], min(2.2, remaining))
+                else:
+                    ok, reason = probe_protocol(upstream, request['echo_port'], min(2.2, remaining))
+                if ok:
+                    return dict(candidate, host=host, protocol=protocol, verified=True, reason=reason)
+        if request.get('allow_external') and str(candidate.get('source', '')).startswith(('system', 'manual')):
+            for host in order:
+                for protocol in protocols:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return dict(candidate, verified=False, reason=reason, pending=True)
+                    network = network_test(dict(host=host, port=candidate['port'], protocol=protocol), min(8, remaining))
+                    reason = network['reason']
+                    if network['ok']:
+                        return dict(candidate, host=host, protocol=protocol, verified=True, reason=reason, external=True)
+        return dict(candidate, verified=False, reason=reason)
+
+    workers = min(16, max(1, int(request.get('max_workers', 8))))
+    executor = ThreadPoolExecutor(max_workers=workers)
+    futures = [executor.submit(probe, candidate) for candidate in candidates]
+    done, pending = wait(futures, timeout=max(0, deadline - time.monotonic()))
+    results = []
+    for candidate, future in zip(candidates, futures):
+        if future in done:
+            try:
+                results.append(future.result())
+            except (OSError, ValueError, KeyError) as error:
+                results.append(dict(candidate, verified=False, reason=str(error)))
+        else:
+            future.cancel()
+            results.append(dict(candidate, verified=False, pending=True, reason='检测时间预算已用完'))
+    executor.shutdown(wait=True)
+    pending_count = sum(bool(item.get('pending')) for item in results)
+    return dict(results=results, hosts=hosts, coverage=dict(total=len(results), completed=len(results) - pending_count, pending=pending_count))
 
 
 def dispatch(request):
     action = request['action']
     manager = Manager(Path.home())
     if action == 'probe':
-        results = []
-        hosts = reachable_hosts()
-        for candidate in request['candidates']:
-            address = candidate.get('address', candidate.get('host', '127.0.0.1'))
-            if address == '0.0.0.0':
-                order = [host for host in hosts if ':' not in host]
-            elif address == '::':
-                order = hosts
-            else:
-                order = [address]
-            failures = []
-            for host in order:
-                ok, reason = probe_http(host, candidate['port'], request['echo_port'])
-                if ok:
-                    results.append(dict(candidate, host=host, verified=True))
-                    break
-                failures.append(reason)
-            else:
-                results.append(dict(candidate, verified=False, reason=failures[-1]))
-        return {'results': results, 'hosts': hosts}
+        return probe_candidates(request)
+    if action == 'connect_gateway':
+        if gateway is None:
+            raise RuntimeError('缺少 WSL gateway payload。')
+        upstream = gateway.validate_upstream(request['upstream'])
+        plan = gateway.prepare(manager.home, upstream)
+        network = {}
+        def verify_connection():
+            network.update(network_test(dict(host='127.0.0.1', port=int(plan['url'].rsplit(':', 1)[1]), protocol='http')))
+            if not network['ok']:
+                raise RuntimeError(network['reason'])
+        result = manager.apply(plan['url'], codex=request.get('codex', False),
+                               extra_files=plan['files'], gateway_mode=True, verify_connection=verify_connection)
+        result.update(local_url=plan['url'], upstream=upstream, network=network)
+        result['message'] += ' ' + network['reason']
+        return result
+    if action == 'gateway_status':
+        return gateway.status(manager.home)
+    if action == 'apps':
+        try:
+            from . import app_checks
+        except ImportError:
+            app_checks = sys.modules.get('toolbox_app_checks')
+        if app_checks is None:
+            raise RuntimeError('缺少 WSL 应用诊断 payload。')
+        return app_checks.check(manager.home, gateway)
     if action == 'apply':
         return manager.apply(request.get('url'), codex=request.get('codex', False))
     if action == 'rollback':
@@ -437,8 +546,10 @@ def dispatch(request):
         return {'message': https_test(request['url'])}
     if action == 'status':
         content = read(manager.shell)
-        return {'message': '当前用户已有工具管理的代理文件。' if content else '当前用户尚未配置工具管理的代理。',
-                'configured': bool(content)}
+        match = re.search(rb'^export http_proxy=(.+)$', content or b'', re.M)
+        url = match.group(1).decode().strip("'\"") if match else None
+        return {'message': '当前用户已有工具管理的代理文件。' if url else '当前用户尚未配置工具管理的代理。',
+                'configured': bool(url), 'url': url}
     raise ValueError('未知的 WSL 操作。')
 
 

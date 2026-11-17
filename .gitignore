@@ -3,6 +3,8 @@ __pycache__/
 .venv/
 build/
 dist/
+dist-universal/
+dist-preview2/
 *.spec
 .local/
 .superpowers/

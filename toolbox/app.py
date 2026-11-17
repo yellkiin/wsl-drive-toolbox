@@ -7,6 +7,8 @@ from tkinter import messagebox, simpledialog, ttk
 
 from . import __version__
 from .settings import load_settings, save_settings
+from .disk_view import inspection_text
+from .disk_native import is_explorer
 
 BG = '#f3f6fa'
 INK = '#17283d'
@@ -30,6 +32,7 @@ class ToolboxApp:
         self.controls = []
         self.candidates, self.disk_rows = [], []
         self.inspection = None
+        self.inspection_elevated = False
         self.page = 'proxy'
         self.distro = tk.StringVar(value=self.preferences.get('distro', ''))
         self.user = tk.StringVar(value=self.preferences.get('user', ''))
@@ -48,7 +51,7 @@ class ToolboxApp:
 
     def _build(self):
         r = self.root
-        r.title('WSL 与移动硬盘工具箱' + (' · 演示' if self.demo else ''))
+        r.title('WSL 工具箱 · 通用预览' + (' · 演示' if self.demo else ''))
         r.geometry('1120x800')
         r.minsize(1000, 760)
         r.configure(bg=BG)
@@ -83,7 +86,7 @@ class ToolboxApp:
         main.pack(side='left', fill='both', expand=True, padx=30, pady=20)
         self.heading = tk.Label(main, text='连接，一步到位。', bg=BG, fg=INK, font=('Microsoft YaHei UI', 21, 'bold'))
         self.heading.pack(anchor='w')
-        self.subtitle = tk.Label(main, text='自动识别 SakuraCat / Clash Verge，让 WSL 使用正确的代理。', bg=BG, fg=MUTED)
+        self.subtitle = tk.Label(main, text='发现 HTTP / HTTPS / SOCKS5 代理，通过固定入口连接 WSL。', bg=BG, fg=MUTED)
         self.subtitle.pack(anchor='w', pady=(7, 14))
         self.container = tk.Frame(main, bg=BG)
         self.pages = {k: tk.Frame(self.container, bg=BG) for k in ('proxy', 'disk')}
@@ -119,7 +122,7 @@ class ToolboxApp:
     def _proxy_page(self, parent):
         card = self.card(parent)
         tk.Label(card, text='工作环境', bg='white', fg=INK, font=('Microsoft YaHei UI', 11, 'bold')).grid(row=0, column=0, sticky='w', columnspan=4, pady=(0, 13))
-        for col, text in [(0, 'WSL 发行版'), (1, 'Linux 用户'), (2, '代理来源')]:
+        for col, text in [(0, 'WSL 发行版'), (1, 'Linux 用户'), (2, '按程序筛选')]:
             tk.Label(card, text=text, bg='white', fg=MUTED, font=('Microsoft YaHei UI', 9)).grid(row=1, column=col, sticky='w', padx=(0, 12), pady=(0, 5))
         self.distro_combo = self.combo(card, self.distro, width=22)
         self.distro_combo.grid(row=2, column=0, sticky='ew', padx=(0, 12))
@@ -127,7 +130,7 @@ class ToolboxApp:
         self.user_combo = self.combo(card, self.user, width=16)
         self.user_combo.grid(row=2, column=1, sticky='ew', padx=(0, 12))
         self.user_combo.bind('<<ComboboxSelected>>', lambda _: self.target_changed())
-        self.family_combo = self.combo(card, self.family, ['自动选择', 'SakuraCat', 'Clash Verge'], width=17)
+        self.family_combo = self.combo(card, self.family, ['自动选择'], width=17)
         self.family_combo.grid(row=2, column=2, sticky='ew', padx=(0, 12))
         self.family_combo.bind('<<ComboboxSelected>>', lambda _: self.target_changed())
         self.button(card, '刷新', self.refresh_distros).grid(row=0, column=3, sticky='e', pady=(0, 9))
@@ -147,15 +150,15 @@ class ToolboxApp:
         self.button(row, '重新检测', self.scan).pack(side='left', padx=10)
         self.button(row, '打开新终端', self.open_terminal).pack(side='left')
         tk.Label(parent, text='可用代理   ·   检测后可点选一行，指定本次连接', bg=BG, fg=MUTED, font=('Microsoft YaHei UI', 9)).pack(anchor='w', pady=(0, 6))
-        self.proxy_tree = ttk.Treeview(parent, columns=('app', 'endpoint', 'state'), show='headings', height=3, selectmode='browse')
-        for key, title, width in [('app', '代理软件', 170), ('endpoint', 'WSL 可达地址', 220), ('state', '验证结果', 240)]:
+        self.proxy_tree = ttk.Treeview(parent, columns=('app', 'protocol', 'endpoint', 'state'), show='headings', height=3, selectmode='browse')
+        for key, title, width in [('app', '代理程序', 150), ('protocol', '协议', 75), ('endpoint', '上游地址', 205), ('state', '验证结果', 200)]:
             self.proxy_tree.heading(key, text=title)
             self.proxy_tree.column(key, width=width, anchor='w')
         self.proxy_tree.bind('<Button-1>', self._freeze_selection)
         self.proxy_tree.bind('<Key>', self._freeze_selection)
         row = tk.Frame(parent, bg=BG)
         row.pack(side='bottom', fill='x', pady=(14, 0))
-        for title, fn in [('关闭显式代理', self.disable), ('回滚上次配置', self.rollback), ('网络诊断', self.diagnose), ('手动端口', self.manual)]:
+        for title, fn in [('关闭代理', self.disable), ('回滚配置', self.rollback), ('网络诊断', self.diagnose), ('工具联网检查', self.check_apps), ('完整检测', lambda: self.scan(extended=True)), ('手动地址', self.manual)]:
             self.button(row, title, fn).pack(side='left', padx=(0, 9))
         self.proxy_tree.pack(fill='both', expand=True)
 
@@ -168,6 +171,7 @@ class ToolboxApp:
         row.pack(fill='x', pady=(18, 0))
         self.button(row, '安全弹出', self.eject, True).pack(side='left')
         self.button(row, '查看占用', self.inspect_disk).pack(side='left', padx=10)
+        self.button(row, '管理员扫描', lambda: self.inspect_disk(elevated=True)).pack(side='left', padx=(0, 10))
         self.button(row, '刷新硬盘', self.refresh_disks).pack(side='left')
         self.disk_tree = ttk.Treeview(parent, columns=('letters', 'name', 'size'), show='headings', height=3, selectmode='browse')
         for key, title, width in [('letters', '盘符', 100), ('name', '设备', 370), ('size', '容量', 130)]:
@@ -182,8 +186,13 @@ class ToolboxApp:
         top.pack(fill='x')
         tk.Label(top, text='占用情况', bg='white', fg=INK, font=('Microsoft YaHei UI', 11, 'bold')).pack(side='left')
         self.button(top, '正常关闭占用并重试', self.close_and_eject).pack(side='right')
-        self.occupancy = tk.Text(panel, height=6, wrap='word', bg='white', fg=MUTED, bd=0, font=('Microsoft YaHei UI', 10), state='disabled')
-        self.occupancy.pack(fill='both', expand=True, pady=(10, 0))
+        evidence_frame = tk.Frame(panel, bg='white')
+        evidence_frame.pack(fill='both', expand=True, pady=(10, 0))
+        self.occupancy = tk.Text(evidence_frame, height=6, wrap='word', bg='white', fg=MUTED, bd=0, font=('Microsoft YaHei UI', 10), state='disabled')
+        evidence_scroll = ttk.Scrollbar(evidence_frame, command=self.occupancy.yview)
+        evidence_scroll.pack(side='right', fill='y')
+        self.occupancy.configure(yscrollcommand=evidence_scroll.set)
+        self.occupancy.pack(side='left', fill='both', expand=True)
         self._occupancy_text('选择硬盘后点击「查看占用」。\n只请求程序正常退出；遇到保存提示，请先完成保存。')
         tk.Label(parent, text='只有显示「可以拔出」后，再拔下硬盘。系统拒绝移除时会保留连接。', bg=BG, fg=MUTED, wraplength=740, justify='left', font=('Microsoft YaHei UI', 9)).pack(anchor='w', pady=(0, 5))
 
@@ -194,7 +203,7 @@ class ToolboxApp:
             self.nav[key].configure(bg='#244156' if key == page else NAVY, fg='white' if key == page else '#b6c8d5')
         self.pages[page].pack(fill='both', expand=True)
         self.heading.configure(text='连接，一步到位。' if page == 'proxy' else '拔出之前，交给工具箱。')
-        self.subtitle.configure(text='自动识别 SakuraCat / Clash Verge，让 WSL 使用正确的代理。' if page == 'proxy' else '找到占用，正常关闭，让 Windows 确认安全移除。')
+        self.subtitle.configure(text='发现 HTTP / HTTPS / SOCKS5 代理，通过固定入口连接 WSL。' if page == 'proxy' else '找到占用，正常关闭，让 Windows 确认安全移除。')
         if page == 'disk' and not self.disk_rows and not self.busy:
             self.refresh_disks()
 
@@ -314,26 +323,32 @@ class ToolboxApp:
 
     def _scan_result(self, result):
         self.candidates = result.get('candidates', [])
+        names = sorted({c['app'] for c in self.candidates})
+        self.family_combo['values'] = ['自动选择'] + sorted(set(names + ([self.family.get()] if self.family.get() != '自动选择' else [])))
         selected = result.get('selected')
         reason = result.get('reason', '')
         if self.family.get() != '自动选择':
             self.candidates = [c for c in self.candidates if c['app'] == self.family.get()]
-            selected = self.candidates[0] if len(self.candidates) == 1 else None
+            selected = self.candidates[0] if len(self.candidates) == 1 and self.candidates[0].get('verified', True) else None
             reason = '已筛选 ' + self.family.get() + '；点击连接，或从列表中选择端口。'
         self.proxy_tree.delete(*self.proxy_tree.get_children())
         for i, c in enumerate(self.candidates):
-            self.proxy_tree.insert('', 'end', iid=str(i), values=(c['app'], f"{c['host']}:{c['port']}", '本机代理验证通过'))
+            verified = c.get('verified', True)
+            self.proxy_tree.insert('', 'end', iid=str(i), values=(c['app'], c.get('protocol', 'http').upper(), f"{c['host']}:{c['port']}", '转发验证通过' if verified else '未确认 · 连接时验证'))
             if c == selected:
                 self.proxy_tree.selection_set(str(i))
-        self.proxy_status.set(f'发现 {len(self.candidates)} 个可用代理' if self.candidates else '没有找到可确认的代理')
+        self.proxy_status.set(f'发现 {len(self.candidates)} 个代理候选' if self.candidates else '没有找到可确认的代理')
         self.proxy_detail.set(reason or '选中一行后点击「一键连接 WSL」。')
         for issue in result.get('issues', []):
             self._log(str(issue))
+        coverage = result.get('coverage')
+        if coverage:
+            self._log(f"已检测 {coverage.get('completed', 0)} / {coverage.get('total', 0)} 个监听端点；未完成 {coverage.get('pending', 0)}。")
 
-    def scan(self):
+    def scan(self, extended=False):
         target = self.target()
         if target:
-            self.run('检测实际代理端口', lambda: self.proxy.scan(*target), self._scan_result)
+            self.run('完整检测本机监听代理' if extended else '检测实际代理端口', lambda: self.proxy.scan(*target, extended=extended), self._scan_result)
 
     def connect(self, candidate=None):
         target = self.target()
@@ -348,8 +363,13 @@ class ToolboxApp:
 
     def _connected(self, result):
         c = result.get('candidate')
-        self.proxy_status.set('WSL 代理已配置')
-        self.proxy_detail.set((f"{c['app']}  ·  {c['host']}:{c['port']}\n" if c else '') + result.get('message', '请打开新终端加载代理。'))
+        network = result.get('network') or {}
+        self.proxy_status.set('WSL 入口已配置 · 外网验证通过' if network.get('ok') else 'WSL 入口已配置 · 请查看网络结果')
+        lines = ['应用入口：' + result['local_url']] if result.get('local_url') else []
+        if c:
+            lines.append(f"上游：{c['app']} · {c.get('protocol', 'http').upper()} · {c['host']}:{c['port']}")
+        lines.append(network.get('message') or result.get('message', '请打开新终端加载代理。'))
+        self.proxy_detail.set('\n'.join(lines))
         self._log(result.get('message', '已完成'))
         self.candidates = []
         self.proxy_tree.delete(*self.proxy_tree.get_children())
@@ -382,9 +402,41 @@ class ToolboxApp:
         self._log(result.get('message', ''))
 
     def manual(self):
-        port = simpledialog.askinteger('手动 HTTP / 混合端口', '输入代理软件当前的 HTTP 或混合端口：', parent=self.root, minvalue=1, maxvalue=65535)
-        if port:
-            self.connect({'app': '手动', 'host': '127.0.0.1', 'port': port})
+        address = simpledialog.askstring('手动代理地址', '输入 http://主机:端口、https://主机:端口 或 socks5://主机:端口。\n也可只输入本机端口。此预览版不接收账号密码。', parent=self.root)
+        if not address:
+            return
+        address = address.strip()
+        self.family.set('自动选择')
+        if address.isdigit():
+            self.connect({'app': '手动', 'host': '127.0.0.1', 'port': int(address), 'protocol': 'auto'})
+        else:
+            self.connect({'app': '手动', 'host': address if '://' in address else 'http://' + address, 'protocol': 'auto'})
+
+    def check_apps(self):
+        target = self.target()
+        if target:
+            self.proxy_detail.set('只读查询公开站点，检查 curl / Git / pip / npm / Node；Codex 仅检查版本和代理覆盖。')
+            self.run('验证常用工具的实际联网路径（可能需要一分钟）', lambda: self.proxy.check_apps(*target), self._app_checks_result)
+
+    def _app_checks_result(self, result):
+        self.proxy_status.set('应用联网检查完成')
+        self.proxy_detail.set(result.get('message', ''))
+        window = tk.Toplevel(self.root)
+        window.title('工具联网检查 · 通用预览')
+        window.geometry('820x620')
+        body = tk.Text(window, wrap='word', padx=20, pady=16, font=('Microsoft YaHei UI', 10), bg='white', fg=INK)
+        scrollbar = ttk.Scrollbar(window, command=body.yview)
+        scrollbar.pack(side='right', fill='y')
+        body.configure(yscrollcommand=scrollbar.set)
+        body.pack(fill='both', expand=True)
+        labels = {'ok':'请求成功并观察到代理连接', 'bypass':'已联网，路径未确认', 'failed':'未通过', 'not_installed':'未安装', 'configuration':'配置检查'}
+        body.insert('end', result.get('message', '') + '\n\n')
+        for row in result.get('tools', []):
+            body.insert('end', row['name'] + ' — ' + labels.get(row['status'], row['status']) + '\n' + row['detail'] + '\n\n')
+        if result.get('warnings'):
+            body.insert('end', '需要核对的独立配置\n' + '\n'.join(result['warnings']))
+        body.configure(state='disabled')
+        self._log(result.get('message', ''))
 
     def open_terminal(self):
         target = self.target()
@@ -408,6 +460,7 @@ class ToolboxApp:
 
     def _disk_changed(self, _=None):
         self.inspection = None
+        self.inspection_elevated = False
         disk = self.selected_disk(prompt=False)
         if disk:
             self.preferences['disk_id'] = disk['id']
@@ -430,18 +483,24 @@ class ToolboxApp:
         self.occupancy.insert('end', text)
         self.occupancy.configure(state='disabled')
 
-    def inspect_disk(self):
+    def _inspection_result(self, disk, info, elevated=False):
+        self.inspection = (disk['id'], info)
+        self.inspection_elevated = elevated
+        self._occupancy_text(inspection_text(info))
+        count = len(info.get('processes', []))
+        self.disk_detail.set(f'找到 {count} 个关联进程。可滚动查看文件句柄、服务和历史失败记录。')
+        self._log('占用检查完成。')
+
+    def inspect_disk(self, elevated=False):
         disk = self.selected_disk()
         if disk:
-            def done(info):
-                self.inspection = (disk['id'], info)
-                lines = [f"程序：{p['name']}  (PID {p['pid']})" for p in info.get('processes', [])]
-                lines += ['盘上 WSL：' + d for d in info.get('distros', [])]
-                lines += [f"WSL 挂载：{m['distro']} → {m['target']}" for m in info.get('mounts', [])]
-                lines += info.get('warnings', [])
-                self._occupancy_text('\n'.join(lines) or '未识别到占用程序；最终以 Windows 移除结果为准。')
-                self._log('占用检查完成。')
-            self.run('检查硬盘占用', lambda: self.disks.inspect_disk(disk), done)
+            def work():
+                if elevated and not self.demo:
+                    from .disk_tasks import run_elevated
+                    return run_elevated({'action':'inspect', 'disk':disk})
+                return self.disks.inspect_disk(disk)
+            label = '管理员句柄扫描（请处理 Windows 授权提示）' if elevated else '扫描硬盘文件与磁盘句柄'
+            self.run(label, work, lambda info: self._inspection_result(disk, info, elevated))
 
     def eject(self):
         disk = self.selected_disk()
@@ -456,19 +515,79 @@ class ToolboxApp:
             self.inspect_disk()
             return
         info = self.inspection[1]
-        objects = [p['name'] for p in info.get('processes', [])]
+        objects = [(p['name'] + '（仅关闭目标盘窗口，窗口内其他标签也会关闭）'
+                    if is_explorer(p) else p['name'])
+                   for p in info.get('processes', []) if not p.get('services')]
         objects += ['停止 WSL：' + d for d in info.get('distros', [])]
         objects += [f"卸载：{m['distro']} {m['target']}" for m in info.get('mounts', [])]
-        if objects and not messagebox.askokcancel('正常关闭占用并弹出', '将处理以下占用：\n\n' + '\n'.join(objects) + '\n\n请先保存文件和 WSL 任务。程序弹出保存提示时，请完成保存；不会强制结束程序。', parent=self.root):
+        selected = []
+        if info.get('services'):
+            selected = self._select_services(info['services'], objects)
+            if selected is None:
+                return
+        elif objects and not messagebox.askokcancel('正常关闭占用并弹出', '将处理以下占用：\n\n' + '\n'.join(objects) + '\n\n请先保存文件和 WSL 任务。程序弹出保存提示时，请完成保存；不会强制结束程序。', parent=self.root):
             return
-        self.run('正常释放占用并请求移除', lambda: self.disks.close_and_eject(disk, info), lambda result: self._eject_result(disk, result))
+        elevated = bool(selected) or self.inspection_elevated
+        def work():
+            if elevated and not self.demo:
+                from .disk_tasks import run_elevated
+                return run_elevated({'action':'cleanup','disk':disk,'inspection':info,'selected_services':selected})
+            return self.disks.close_and_eject(disk, info, selected_services=selected)
+        self.run('正常释放已确认占用（可能需要管理员授权）' if elevated else '正常释放占用并请求移除', work, lambda result: self._eject_result(disk, result))
+
+    def _select_services(self, services, objects):
+        dialog = tk.Toplevel(self.root)
+        dialog.title('确认关闭对象与服务')
+        dialog.geometry('760x570')
+        dialog.transient(self.root)
+        tk.Label(dialog, text='服务默认不停止，请勾选本次需要正常停止的服务。', anchor='w', padx=18, pady=14).pack(fill='x')
+        tk.Label(dialog, text='系统核心、驱动、共享宿主或受保护服务只显示原因，不能在此停止。', anchor='w', padx=18, wraplength=710, justify='left').pack(fill='x')
+        body = tk.Frame(dialog)
+        body.pack(fill='both', expand=True, padx=18, pady=12)
+        canvas = tk.Canvas(body, highlightthickness=0)
+        scroll = ttk.Scrollbar(body, command=canvas.yview)
+        scroll.pack(side='right', fill='y')
+        canvas.configure(yscrollcommand=scroll.set)
+        canvas.pack(side='left', fill='both', expand=True)
+        inner = tk.Frame(canvas)
+        canvas.create_window((0, 0), window=inner, anchor='nw')
+        inner.bind('<Configure>', lambda _: canvas.configure(scrollregion=canvas.bbox('all')))
+        choices = []
+        for service in services:
+            variable = tk.BooleanVar(value=False)
+            label = f"{service.get('display_name', service['name'])} [{service['name']}]  PID {service['pid']}"
+            check = ttk.Checkbutton(inner, text=label, variable=variable)
+            check.pack(anchor='w', pady=(6, 0))
+            if not service.get('can_stop'):
+                check.configure(state='disabled')
+            if service.get('reason'):
+                tk.Label(inner, text=service['reason'], wraplength=680, justify='left', fg=MUTED).pack(anchor='w', padx=20)
+            choices.append((service, variable))
+        if objects:
+            tk.Label(inner, text='\n还将请求关闭或释放：\n' + '\n'.join(objects), wraplength=680, justify='left').pack(anchor='w')
+        tk.Label(dialog, text='请先保存文件与 WSL 任务。只请求正常停止，不强杀进程，也不禁用服务。', wraplength=710, justify='left', padx=18).pack(fill='x')
+        selected = [None]
+        def accept():
+            selected[0] = [s for s, var in choices if s.get('can_stop') and var.get()]
+            dialog.destroy()
+        buttons = tk.Frame(dialog)
+        buttons.pack(fill='x', padx=18, pady=14)
+        ttk.Button(buttons, text='取消', command=dialog.destroy).pack(side='right', padx=6)
+        ttk.Button(buttons, text='按所选对象处理并重试', command=accept).pack(side='right')
+        dialog.grab_set()
+        self.root.wait_window(dialog)
+        return selected[0]
 
     def _eject_result(self, disk, result):
+        if result.get('remaining') is not None:
+            self._inspection_result(disk, result['remaining'], self.inspection_elevated)
         success = result.get('success', False)
         label = ', '.join(disk['letters']) + ' · ' + disk['name']
         self.disk_status.set(label + (' 可以拔出' if success else ' 暂时无法弹出'))
         self.disk_detail.set(result.get('message', ''))
         self._log(result.get('message', ''))
+        for outcome in result.get('outcomes', []):
+            self._log(outcome.get('name', '') + '：' + outcome.get('message', ''))
         if success:
             self.inspection = None
             self.disk_tree.selection_remove(*self.disk_tree.selection())
