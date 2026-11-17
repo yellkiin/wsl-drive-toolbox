@@ -1,6 +1,6 @@
 # 通用代理预览版说明
 
-本说明对应 `feature/universal-proxy` 的 0.2.0a1 源码。它与 [v0.1.0 稳定版](https://github.com/yellkiin/wsl-drive-toolbox/releases/tag/v0.1.0) 分开交付；计划使用 `v0.2.0-preview.1` 预览标签。新增功能是否已在某台机器上通过验证，应以该次发布的验证记录为准。
+本说明对应 `feature/universal-proxy` 的通用代理功能，当前源码版本为 0.2.0a2 / `v0.2.0-preview.2`，增加了[硬盘句柄诊断](disk-occupancy.md)。它与 [v0.1.0 稳定版](https://github.com/yellkiin/wsl-drive-toolbox/releases/tag/v0.1.0) 分开交付。新增功能是否已在某台机器上通过验证，应以该次发布的验证记录为准。
 
 ## 从原版试用
 

@@ -1,4 +1,5 @@
 import copy
+import shutil
 import unittest
 from unittest.mock import patch
 
@@ -34,6 +35,10 @@ class FakeNative:
         self.events.append(("close", process["pid"]))
         return not self.refuse_close
 
+    def close_explorer(self, process, disk):
+        self.events.append(("explorer_windows", process["pid"], disk["id"]))
+        return {"success": True, "message": "target windows closed"}
+
     def release_mount(self, mount):
         self.events.append(("umount", mount["distro"], mount["target"]))
         return not self.refuse_mount
@@ -44,6 +49,10 @@ class FakeNative:
     def request_eject(self, disk):
         self.events.append(("eject", disk["id"]))
         return self.result
+
+    def stop_service(self, service):
+        self.events.append(("service", service["name"]))
+        return {"success": True, "message": "stopped"}
 
 
 class DiskSafetyTests(unittest.TestCase):
@@ -110,6 +119,7 @@ class DiskSafetyTests(unittest.TestCase):
         result = disks.eject(self.target)
         self.assertFalse(result["success"])
         self.assertEqual(result["veto"], "OutstandingOpen")
+        self.assertIn("remaining", result)
 
     def test_refused_normal_close_prevents_eject(self):
         self.native.info["processes"] = [{"pid": 42, "name": "editor", "created": 900}]
@@ -118,12 +128,27 @@ class DiskSafetyTests(unittest.TestCase):
         self.assertFalse(result["success"])
         self.assertEqual(self.native.events, [("close", 42)])
 
+    def test_explorer_closes_target_disk_windows_instead_of_entire_process(self):
+        self.native.info["processes"] = [{"pid": 42, "name": "explorer.exe", "created": 900}]
+        result = disks.close_and_eject(self.target, copy.deepcopy(self.native.info))
+        self.assertTrue(result["success"])
+        self.assertEqual(self.native.events, [("explorer_windows", 42, self.target["id"]),
+                                              ("eject", self.target["id"])])
+
     def test_new_process_requires_new_confirmation(self):
         accepted = copy.deepcopy(self.native.info)
         self.native.info["processes"] = [{"pid": 42, "name": "editor", "created": 900}]
         result = disks.close_and_eject(self.target, accepted)
         self.assertFalse(result["success"])
         self.assertEqual(self.native.events, [])
+
+    def test_no_second_scan_when_cleanup_then_eject_is_vetoed(self):
+        scans = []
+        self.native.inspect = lambda _: scans.append(1) or copy.deepcopy(self.native.info)
+        self.native.result = {"success": False, "message": "busy", "veto": "device"}
+        result = disks.close_and_eject(self.target, copy.deepcopy(self.native.info))
+        self.assertEqual(len(scans), 2)
+        self.assertIn("remaining", result)
 
     def test_busy_mount_does_not_force_stop_unconsented_distro(self):
         self.native.info["mounts"] = [{"distro": "OtherLinux", "target": "/mnt/r", "source": "R:\\"}]
@@ -150,8 +175,269 @@ class DiskSafetyTests(unittest.TestCase):
             disks.close_and_eject(self.target, copy.deepcopy(self.native.info))
         self.assertEqual(self.native.events, [])
 
+    def test_close_refusal_does_not_skip_other_approved_cleanup(self):
+        self.native.info.update(processes=[{"pid": 42, "name": "editor", "created": 900},
+                                           {"pid": 43, "name": "viewer", "created": 901}],
+                                distros=["Linux"])
+        self.native.refuse_close = True
+        result = disks.close_and_eject(self.target, copy.deepcopy(self.native.info))
+        self.assertEqual(self.native.events, [("close", 42), ("close", 43), ("stop", "Linux")])
+        self.assertFalse(result["success"])
+        self.assertEqual(len(result["outcomes"]), 3)
+        self.assertIn("remaining", result)
+
+    def test_services_require_explicit_selection_and_never_window_close_host(self):
+        service = {"name": "VendorSvc", "display_name": "Vendor", "pid": 42,
+                   "created": 900, "can_stop": True, "reason": ""}
+        self.native.info.update(processes=[{"pid": 42, "name": "vendor.exe", "created": 900,
+                                            "services": [service], "can_close": False}], services=[service])
+        result = disks.close_and_eject(self.target, copy.deepcopy(self.native.info))
+        self.assertTrue(result["success"])
+        self.assertEqual(self.native.events, [("eject", self.target["id"])])
+        self.native.events.clear()
+        result = disks.close_and_eject(self.target, copy.deepcopy(self.native.info), [service])
+        self.assertTrue(result["success"])
+        self.assertEqual(self.native.events[0], ("service", "VendorSvc"))
+
+    def test_changed_selected_service_identity_requires_confirmation(self):
+        service = {"name": "VendorSvc", "pid": 42, "created": 900, "can_stop": True}
+        self.native.info["services"] = [dict(service, created=901)]
+        result = disks.close_and_eject(self.target, dict(self.native.info, services=[service]), [service])
+        self.assertFalse(result["success"])
+        self.assertEqual(self.native.events, [])
+
 
 class NativeRulesTests(unittest.TestCase):
+    def setUp(self):
+        scanner = patch.object(disk_native, "_handle_scan", return_value={
+            "processes": [], "coverage": {"partial": False}, "warnings": []})
+        scanner.start()
+        self.addCleanup(scanner.stop)
+
+    def test_handle_evidence_includes_c_installed_service_and_preserves_image_evidence(self):
+        adapter = object.__new__(disk_native.WindowsDisks)
+        adapter._running_distros = lambda: []
+        adapter._installed_distros = lambda: []
+        adapter._path_volume = lambda path: "volume-a" if path.startswith("R:") else "other"
+        adapter._process_record = lambda pid, name: {"pid": pid, "name": name, "created": 900}
+        adapter._restart_manager = lambda _: []
+        adapter._service_inventory = lambda: [{"Name": "VendorSvc", "DisplayName": "Vendor",
+            "ProcessId": 42, "State": "Running", "AcceptStop": True, "ServiceType": "Own Process",
+            "PathName": '"C:\\Program Files\\Vendor\\svc.exe"', "StartMode": "Auto"}]
+        adapter._service_protections = lambda names: {name: {"protected": 0} for name in names}
+        adapter._recent_blocks = lambda _: []
+        scan = {"processes": [{"pid": 42, "name": "svc.exe", "created": 900,
+                "executable": "C:\\Program Files\\Vendor\\svc.exe", "handle_count": 1,
+                "evidence": [{"source": "handle", "path": "R:\\data", "kind": "file"}]}],
+                "coverage": {"partial": True}, "warnings": ["access denied"]}
+        with patch.object(disk_native, "_handle_scan", return_value=scan, create=True), patch.object(
+                disk_native, "_ps", return_value=[{"ProcessId": 42, "Name": "svc.exe",
+                                                  "ExecutablePath": "R:\\app.exe"}]):
+            info = adapter.inspect(sample_disk())
+        self.assertEqual(len(info["processes"]), 1)
+        self.assertEqual({e["source"] for e in info["processes"][0]["evidence"]}, {"image", "handle"})
+        self.assertTrue(info["services"][0]["can_stop"])
+        self.assertFalse(info["processes"][0]["can_close"])
+        self.assertTrue(info["coverage"]["partial"])
+        self.assertEqual(info["warnings"], ["access denied"])
+
+    def test_explorer_only_closes_target_volume_windows_and_not_shell_process(self):
+        adapter, windows, closed_handles = explorer_fixture()
+        metadata = [{"hwnd": 10, "location_url": "file:///R:/a%20folder"},
+                    {"hwnd": 11, "location_url": "file:///D:/unrelated"},
+                    {"hwnd": 12, "location_url": "file:///C:/mounts/external/nested"},
+                    {"hwnd": 12, "location_url": "file:///R:/other-tab"},
+                    {"hwnd": 13, "location_url": "file:///R:/other-process"},
+                    {"hwnd": 14, "location_url": "shell:Desktop"}]
+        with patch.object(disk_native, "_ps", return_value=metadata):
+            result = adapter.close_explorer({"pid": 42, "name": "explorer.exe", "created": 900}, sample_disk())
+        self.assertTrue(result["success"])
+        self.assertEqual(windows.posted, [(10, 0x10), (12, 0x10)])
+        self.assertEqual(windows.alive, {11, 13, 14})
+        self.assertEqual(closed_handles, [99])
+
+    def test_restart_manager_friendly_name_with_handle_image_routes_to_target_windows(self):
+        adapter = object.__new__(disk_native.WindowsDisks)
+        adapter._running_distros = lambda: []
+        adapter._installed_distros = lambda: []
+        adapter._service_inventory = lambda: []
+        adapter._recent_blocks = lambda _: []
+        adapter._restart_manager = lambda _: [{"pid": 42, "name": "Windows Explorer", "created": 900}]
+        scan = {"processes": [{"pid": 42, "name": "explorer.exe", "created": 900,
+                "executable": "C:\\Windows\\explorer.exe", "handle_count": 1,
+                "evidence": [{"source": "handle", "path": "R:\\folder", "kind": "directory"}]}]}
+        with patch.object(disk_native, "_ps", return_value=[]), patch.object(disk_native, "_handle_scan", return_value=scan):
+            info = adapter.inspect(sample_disk())
+        native = FakeNative()
+        native.info = info
+        with patch.object(disks, "_native", native):
+            result = disks.close_and_eject(sample_disk(), info)
+        self.assertTrue(result["success"])
+        self.assertEqual(native.events[0], ("explorer_windows", 42, sample_disk()["id"]))
+
+    def test_explorer_missing_target_window_or_changed_identity_sends_no_close(self):
+        for scenario in ("no_window", "identity_changed", "cannot_read_metadata"):
+            with self.subTest(scenario=scenario):
+                adapter, windows, closed_handles = explorer_fixture()
+                if scenario == "identity_changed":
+                    adapter._process_record = lambda *_: {"pid": 42, "created": 901}
+                metadata = [{"hwnd": 10, "location_url": "file:///D:/unrelated" if scenario == "no_window" else "file:///R:/target"}]
+                with patch.object(disk_native, "_ps", side_effect=RuntimeError("denied") if scenario == "cannot_read_metadata" else None,
+                                  return_value=metadata):
+                    result = adapter.close_explorer({"pid": 42, "name": "explorer.exe", "created": 900}, sample_disk())
+                self.assertFalse(result["success"])
+                self.assertTrue(result["message"])
+                self.assertEqual(windows.posted, [])
+                self.assertEqual(closed_handles, [99])
+
+    def test_explorer_close_rejection_or_timeout_is_not_success(self):
+        for rejected in (False, True):
+            with self.subTest(rejected=rejected):
+                adapter, windows, _ = explorer_fixture(close_on_post=False, rejected=rejected)
+                with patch.object(disk_native, "_ps", return_value=[{"hwnd": 10, "location_url": "file:///R:/target"}]), patch.object(
+                        disk_native.time, "monotonic", side_effect=[0, 20, 20]), patch.object(disk_native.time, "sleep"), patch.object(
+                        disk_native.C, "get_last_error", return_value=5, create=True):
+                    result = adapter.close_explorer({"pid": 42, "name": "explorer.exe", "created": 900}, sample_disk())
+                self.assertFalse(result["success"])
+                self.assertTrue(result["message"])
+
+    def test_explorer_unknown_window_owner_after_close_is_not_reported_closed(self):
+        adapter, windows, _ = explorer_fixture(close_on_post=False)
+        query_owner = windows.GetWindowThreadProcessId
+        windows.GetWindowThreadProcessId = lambda hwnd, pid: 0 if windows.posted else query_owner(hwnd, pid)
+        with patch.object(disk_native, "_ps", return_value=[{"hwnd": 10, "location_url": "file:///R:/target"}]):
+            result = adapter.close_explorer({"pid": 42, "name": "explorer.exe", "created": 900}, sample_disk())
+        self.assertFalse(result["success"])
+        self.assertIn(10, windows.alive)
+
+    def test_protected_or_unverifiable_service_not_offered_for_stopping(self):
+        adapter = object.__new__(disk_native.WindowsDisks)
+        adapter._running_distros = lambda: []
+        adapter._installed_distros = lambda: []
+        adapter._restart_manager = lambda _: []
+        adapter._service_inventory = lambda: [{"Name": "VendorSvc", "ProcessId": 42, "State": "Running",
+            "AcceptStop": True, "ServiceType": "Own Process", "PathName": '"C:\\Vendor\\svc.exe"'}]
+        adapter._recent_blocks = lambda _: []
+        scan = {"processes": [{"pid": 42, "name": "svc.exe", "created": 900,
+                               "evidence": [{"source": "handle", "path": "R:\\data", "kind": "file"}]}]}
+        for protected in (1, None):
+            with self.subTest(protected=protected):
+                adapter._service_protections = lambda _: {"VendorSvc": {"protected": protected}}
+                with patch.object(disk_native, "_handle_scan", return_value=scan), patch.object(disk_native, "_ps", return_value=[]):
+                    info = adapter.inspect(sample_disk())
+                self.assertFalse(info["services"][0]["can_stop"])
+                self.assertTrue(info["services"][0]["reason"])
+
+    def test_shared_driver_windows_security_and_nonstoppable_services_are_ineligible(self):
+        base = {"Name": "VendorSvc", "ProcessId": 42, "State": "Running", "AcceptStop": True,
+                "ServiceType": "Own Process", "PathName": '"C:\\Vendor\\svc.exe"', "StartMode": "Auto"}
+        process = {"pid": 42, "created": 900}
+        for change, peers in [({"ServiceType": "Share Process"}, 1), ({}, 2),
+                              ({"ServiceType": "Kernel Driver"}, 1),
+                              ({"PathName": "C:\\Windows\\System32\\svc.exe"}, 1),
+                              ({"PathName": r'"\\?\C:\Windows\System32\svc.exe"'}, 1),
+                              ({"PathName": r'"\??\C:\Windows\System32\svc.exe"'}, 1),
+                              ({"PathName": '"C:\\Program Files\\Windows Defender\\MsMpEng.exe"'}, 1),
+                              ({"Name": "WinDefend"}, 1), ({"AcceptStop": False}, 1)]:
+            with self.subTest(change=change, peers=peers):
+                row = disk_native.service_record(dict(base, **change), process, peers)
+                self.assertFalse(row["can_stop"])
+                self.assertTrue(row["reason"])
+
+    def test_recent_pnp_blocks_filter_target_and_exclude_commandline(self):
+        adapter = object.__new__(disk_native.WindowsDisks)
+        events = [{"TimeCreated": "now", "ProcessId": "42", "ProcessName": "C:\\svc.exe",
+                   "DeviceInstance": sample_disk()["pnp_id"], "VetoingDevices": [], "CommandLine": "secret"},
+                  {"ProcessId": "99", "DeviceInstance": "USBSTOR\\OTHER", "VetoingDevices": []}]
+        with patch.object(disk_native, "_ps", return_value=events):
+            rows = adapter._recent_blocks(sample_disk())
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["process_id"], 42)
+        self.assertTrue(rows[0]["historical"])
+        self.assertNotIn("CommandLine", rows[0])
+
+    @unittest.skipUnless(shutil.which("powershell.exe"), "Requires Windows PowerShell")
+    def test_pnp_script_emits_json_arrays_for_zero_and_one_fixture_event(self):
+        adapter = object.__new__(disk_native.WindowsDisks)
+        real_ps = disk_native._ps
+        for count in (0, 1):
+            with self.subTest(count=count):
+                fixture = """
+function Get-WinEvent {
+ [CmdletBinding()] param($FilterHashtable,$MaxEvents)
+"""
+                if count:
+                    fixture += r"""
+ $event=[pscustomobject]@{TimeCreated=[datetime]'2026-11-17T12:00:00'}
+ $event | Add-Member -MemberType ScriptMethod -Name ToXml -Value {
+  '<Event><EventData><Data Name="ProcessId">42</Data><Data Name="ProcessName">C:\fixture.exe</Data><Data Name="DeviceInstance">USBSTOR\DISK\SAMPLE</Data></EventData></Event>'
+ } -PassThru
+"""
+                fixture += "}\n"
+                payloads = []
+                def run_fixture(script):
+                    value = real_ps(fixture + script)
+                    payloads.append(value)
+                    return value
+                with patch.object(disk_native, "_ps", side_effect=run_fixture):
+                    rows = adapter._recent_blocks(sample_disk())
+                self.assertIsInstance(payloads[0], list)
+                self.assertEqual(len(rows), count)
+                if count:
+                    self.assertEqual(rows[0]["process_id"], 42)
+
+    @unittest.skipUnless(shutil.which("powershell.exe"), "Requires Windows PowerShell")
+    def test_explorer_script_emits_json_arrays_for_zero_and_one_fixture_window(self):
+        real_ps = disk_native._ps
+        for count in (0, 1):
+            with self.subTest(count=count):
+                adapter, windows, _ = explorer_fixture()
+                fixture_windows = "@([pscustomobject]@{HWND=10;LocationURL='file:///D:/unrelated'})" if count else "@()"
+                fixture = """
+function New-Object {
+ param($ComObject)
+ $shell=[pscustomobject]@{}
+ $shell | Add-Member -MemberType ScriptMethod -Name Windows -Value { return """ + fixture_windows + """ } -PassThru
+}
+"""
+                payloads = []
+                def run_fixture(script):
+                    value = real_ps(fixture + script)
+                    payloads.append(value)
+                    return value
+                with patch.object(disk_native, "_ps", side_effect=run_fixture):
+                    result = adapter.close_explorer({"pid": 42, "name": "explorer.exe", "created": 900}, sample_disk())
+                self.assertIsInstance(payloads[0], list)
+                self.assertEqual(len(payloads[0]), count)
+                self.assertFalse(result["success"])
+                self.assertIn("未找到", result["message"])
+                self.assertEqual(windows.posted, [])
+
+    def test_native_service_stop_checks_identity_type_protection_and_completion(self):
+        for scenario, expected, controls in [("ok", True, 1), ("changed_pid", False, 0),
+                ("reused_pid", False, 0), ("shared", False, 0), ("protected", False, 0),
+                ("denied", False, 0), ("timeout", False, 1), ("dependent", False, 1),
+                ("windows", False, 0), ("not_stoppable", False, 0)]:
+            with self.subTest(scenario=scenario):
+                adapter = object.__new__(disk_native.WindowsDisks)
+                api = FakeSCM(scenario)
+                adapter.scm = api
+                class Kernel:
+                    def OpenProcess(self, *_):
+                        return 99
+                    def CloseHandle(self, _):
+                        pass
+                adapter.kernel = Kernel()
+                adapter._process_record = lambda *_: {"pid": 42, "created": 901 if scenario == "reused_pid" else 900}
+                with patch.object(disk_native.time, "sleep"), patch.object(
+                        disk_native.time, "monotonic", side_effect=[0, 0, 20, 20]), patch.object(
+                        disk_native.C, "get_last_error", return_value=5, create=True):
+                    result = adapter.stop_service({"name": "VendorSvc", "pid": 42, "created": 900,
+                                                   "can_stop": True})
+                self.assertEqual(result["success"], expected)
+                self.assertEqual(api.controls, controls)
+                self.assertEqual(api.closed, [2, 1])
+
     def test_wsl_backend_service_uses_targeted_wsl_release_not_window_close(self):
         adapter = object.__new__(disk_native.WindowsDisks)
         adapter._running_distros = lambda: []
@@ -211,6 +497,40 @@ class NativeRulesTests(unittest.TestCase):
         with patch.object(disk_native.C, "get_last_error", return_value=5, create=True):
             self.assertFalse(adapter.close_process({"pid": 42, "created": 900, "name": "editor"}))
 
+    def test_generic_close_refuses_explorer_without_disk_window_context(self):
+        adapter, windows, closed_handles = explorer_fixture()
+        windows.EnumWindows = lambda callback, _: [callback(hwnd, 0) for hwnd in sorted(windows.alive)]
+        adapter.kernel.WaitForSingleObject = lambda *_: 0
+        self.assertFalse(adapter.close_process({"pid": 42, "created": 900, "name": "explorer.exe"}))
+        self.assertEqual(windows.posted, [])
+
+    def test_generic_friendly_name_checks_image_from_held_process_handle(self):
+        for image, allowed in [("C:\\Windows\\explorer.exe", False), (None, False),
+                               ("C:\\Vendor\\editor.exe", True)]:
+            with self.subTest(image=image):
+                adapter, windows, closed_handles = explorer_fixture()
+                adapter._process_record = disk_native.WindowsDisks._process_record.__get__(adapter)
+                queried_handles = []
+                def times(handle, created, *_):
+                    created._obj.dwLowDateTime = 900
+                    return True
+                def query_image(handle, _flags, buffer, length):
+                    queried_handles.append(handle)
+                    if image is None:
+                        return False
+                    buffer.value = image
+                    length._obj.value = len(image)
+                    return True
+                adapter.kernel.GetProcessTimes = times
+                adapter.kernel.QueryFullProcessImageNameW = query_image
+                adapter.kernel.WaitForSingleObject = lambda *_: 0
+                windows.EnumWindows = lambda callback, _: [callback(hwnd, 0) for hwnd in sorted(windows.alive)]
+                result = adapter.close_process({"pid": 42, "created": 900, "name": "Windows Explorer"})
+                self.assertEqual(result, allowed)
+                self.assertEqual(bool(windows.posted), allowed)
+                self.assertEqual(queried_handles, [99])
+                self.assertEqual(closed_handles, [99])
+
     def test_uasp_uses_removable_usb_device_and_never_usb_hub(self):
         nodes = [{"id": "SCSI\\DISK&VEN_EXAMPLE\\1", "caps": 0, "service": "disk"},
                  {"id": "USB\\VID_1234&PID_5678\\1", "caps": 4, "service": "UASPStor"},
@@ -238,6 +558,79 @@ class NativeRulesTests(unittest.TestCase):
                 "33 1 0:6 / /other rw - 9p C:\\134mounts\\134external-other rw,aname=drvfs\n")
         mounts = disk_native.parse_mounts("Linux", text, [], ["C:\\mounts\\external\\"])
         self.assertEqual([m["target"] for m in mounts], ["/work"])
+
+
+def explorer_fixture(close_on_post=True, rejected=False):
+    adapter = object.__new__(disk_native.WindowsDisks)
+    closed_handles = []
+    class Kernel:
+        def OpenProcess(self, *_):
+            return 99
+        def CloseHandle(self, handle):
+            closed_handles.append(handle)
+    class Windows:
+        def __init__(self):
+            self.alive, self.posted = {10, 11, 12, 13, 14}, []
+        def IsWindow(self, hwnd):
+            return hwnd in self.alive
+        def GetWindowThreadProcessId(self, hwnd, pid):
+            pid._obj.value = 43 if hwnd == 13 else 42
+            return 1
+        def PostMessageW(self, hwnd, message, *_):
+            self.posted.append((hwnd, message))
+            if rejected:
+                return False
+            if close_on_post:
+                self.alive.discard(hwnd)
+            return True
+    adapter.kernel, adapter.user = Kernel(), Windows()
+    adapter._process_record = lambda *_: {"pid": 42, "created": 900}
+    adapter._path_volume = lambda path: "volume-a" if path.startswith(("R:\\", "C:\\mounts\\external\\")) else "other-volume"
+    return adapter, adapter.user, closed_handles
+
+
+class FakeSCM:
+    """SCM boundary fake; no stop request reaches the machine."""
+    def __init__(self, scenario):
+        self.scenario, self.controls, self.closed = scenario, 0, []
+        self.binary = '"C:\\Windows\\svc.exe"' if scenario == "windows" else '"C:\\Vendor\\svc.exe"'
+
+    def OpenSCManagerW(self, *_):
+        return 1
+
+    def OpenServiceW(self, *_):
+        return 2
+
+    def CloseServiceHandle(self, handle):
+        self.closed.append(handle)
+
+    def QueryServiceStatusEx(self, _handle, _level, buffer, _size, _needed):
+        status = disk_native.C.cast(buffer, disk_native.C.POINTER(disk_native._ServiceStatus)).contents
+        status.service_type = 0x20 if self.scenario == "shared" else 0x10
+        status.state = 1 if self.controls and self.scenario == "ok" else 4
+        status.pid = 43 if self.scenario == "changed_pid" else 42
+        status.controls = 0 if self.scenario == "not_stoppable" else 1
+        return True
+
+    def QueryServiceConfigW(self, _handle, buffer, _size, needed):
+        needed._obj.value = disk_native.C.sizeof(disk_native._ServiceConfig)
+        if buffer is None:
+            return False
+        config = disk_native.C.cast(buffer, disk_native.C.POINTER(disk_native._ServiceConfig)).contents
+        config.service_type = 0x10
+        config.binary = self.binary
+        config.display = "Vendor"
+        return True
+
+    def QueryServiceConfig2W(self, _handle, _level, buffer, _size, _needed):
+        if self.scenario == "denied":
+            return False
+        disk_native.C.cast(buffer, disk_native.C.POINTER(disk_native.W.DWORD)).contents.value = 1 if self.scenario == "protected" else 0
+        return True
+
+    def ControlService(self, *_):
+        self.controls += 1
+        return self.scenario != "dependent"
 
 
 if __name__ == "__main__":

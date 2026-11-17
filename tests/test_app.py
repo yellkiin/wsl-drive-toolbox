@@ -29,8 +29,21 @@ class AppTests(unittest.TestCase):
         self.app.disk_tree.insert('', 'end', iid='0', values=('E:', 'demo', '1000'))
         self.app.disk_tree.selection_set('0')
         self.root.update()
-        self.app.inspection = (disk['id'], self.app.disks.inspect_disk(disk))
+        info = self.app.disks.inspect_disk(disk)
+        info['services'] = []
+        self.app.inspection = (disk['id'], info)
         with patch('toolbox.app.messagebox.askokcancel', return_value=False), patch.object(self.app, 'run') as action:
+            self.app.close_and_eject()
+        action.assert_not_called()
+
+    def test_cancel_service_selection_does_not_launch_elevated_cleanup(self):
+        disk = self.app.disks.disk
+        self.app.disk_rows = [disk]
+        self.app.disk_tree.insert('', 'end', iid='0', values=('E:', 'demo', '1000'))
+        self.app.disk_tree.selection_set('0')
+        self.root.update()
+        self.app.inspection = (disk['id'], self.app.disks.inspect_disk(disk))
+        with patch.object(self.app, '_select_services', return_value=None), patch.object(self.app, 'run') as action:
             self.app.close_and_eject()
         action.assert_not_called()
 

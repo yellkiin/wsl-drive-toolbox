@@ -5,6 +5,13 @@ import sys
 
 
 def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == '--internal-handle-worker':
+        from .disk_handles import worker_main
+        return worker_main(*argv[1:])
+    if len(argv) == 2 and argv[0] == '--internal-disk-task':
+        from .disk_tasks import task_file
+        return task_file(argv[1])
     parser = argparse.ArgumentParser(description='WSL 与移动硬盘工具箱')
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument('--demo', action='store_true', help='使用演示数据打开界面，不操作系统')

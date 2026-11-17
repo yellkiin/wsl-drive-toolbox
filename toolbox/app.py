@@ -7,6 +7,8 @@ from tkinter import messagebox, simpledialog, ttk
 
 from . import __version__
 from .settings import load_settings, save_settings
+from .disk_view import inspection_text
+from .disk_native import is_explorer
 
 BG = '#f3f6fa'
 INK = '#17283d'
@@ -30,6 +32,7 @@ class ToolboxApp:
         self.controls = []
         self.candidates, self.disk_rows = [], []
         self.inspection = None
+        self.inspection_elevated = False
         self.page = 'proxy'
         self.distro = tk.StringVar(value=self.preferences.get('distro', ''))
         self.user = tk.StringVar(value=self.preferences.get('user', ''))
@@ -168,6 +171,7 @@ class ToolboxApp:
         row.pack(fill='x', pady=(18, 0))
         self.button(row, '安全弹出', self.eject, True).pack(side='left')
         self.button(row, '查看占用', self.inspect_disk).pack(side='left', padx=10)
+        self.button(row, '管理员扫描', lambda: self.inspect_disk(elevated=True)).pack(side='left', padx=(0, 10))
         self.button(row, '刷新硬盘', self.refresh_disks).pack(side='left')
         self.disk_tree = ttk.Treeview(parent, columns=('letters', 'name', 'size'), show='headings', height=3, selectmode='browse')
         for key, title, width in [('letters', '盘符', 100), ('name', '设备', 370), ('size', '容量', 130)]:
@@ -182,8 +186,13 @@ class ToolboxApp:
         top.pack(fill='x')
         tk.Label(top, text='占用情况', bg='white', fg=INK, font=('Microsoft YaHei UI', 11, 'bold')).pack(side='left')
         self.button(top, '正常关闭占用并重试', self.close_and_eject).pack(side='right')
-        self.occupancy = tk.Text(panel, height=6, wrap='word', bg='white', fg=MUTED, bd=0, font=('Microsoft YaHei UI', 10), state='disabled')
-        self.occupancy.pack(fill='both', expand=True, pady=(10, 0))
+        evidence_frame = tk.Frame(panel, bg='white')
+        evidence_frame.pack(fill='both', expand=True, pady=(10, 0))
+        self.occupancy = tk.Text(evidence_frame, height=6, wrap='word', bg='white', fg=MUTED, bd=0, font=('Microsoft YaHei UI', 10), state='disabled')
+        evidence_scroll = ttk.Scrollbar(evidence_frame, command=self.occupancy.yview)
+        evidence_scroll.pack(side='right', fill='y')
+        self.occupancy.configure(yscrollcommand=evidence_scroll.set)
+        self.occupancy.pack(side='left', fill='both', expand=True)
         self._occupancy_text('选择硬盘后点击「查看占用」。\n只请求程序正常退出；遇到保存提示，请先完成保存。')
         tk.Label(parent, text='只有显示「可以拔出」后，再拔下硬盘。系统拒绝移除时会保留连接。', bg=BG, fg=MUTED, wraplength=740, justify='left', font=('Microsoft YaHei UI', 9)).pack(anchor='w', pady=(0, 5))
 
@@ -451,6 +460,7 @@ class ToolboxApp:
 
     def _disk_changed(self, _=None):
         self.inspection = None
+        self.inspection_elevated = False
         disk = self.selected_disk(prompt=False)
         if disk:
             self.preferences['disk_id'] = disk['id']
@@ -473,18 +483,24 @@ class ToolboxApp:
         self.occupancy.insert('end', text)
         self.occupancy.configure(state='disabled')
 
-    def inspect_disk(self):
+    def _inspection_result(self, disk, info, elevated=False):
+        self.inspection = (disk['id'], info)
+        self.inspection_elevated = elevated
+        self._occupancy_text(inspection_text(info))
+        count = len(info.get('processes', []))
+        self.disk_detail.set(f'找到 {count} 个关联进程。可滚动查看文件句柄、服务和历史失败记录。')
+        self._log('占用检查完成。')
+
+    def inspect_disk(self, elevated=False):
         disk = self.selected_disk()
         if disk:
-            def done(info):
-                self.inspection = (disk['id'], info)
-                lines = [f"程序：{p['name']}  (PID {p['pid']})" for p in info.get('processes', [])]
-                lines += ['盘上 WSL：' + d for d in info.get('distros', [])]
-                lines += [f"WSL 挂载：{m['distro']} → {m['target']}" for m in info.get('mounts', [])]
-                lines += info.get('warnings', [])
-                self._occupancy_text('\n'.join(lines) or '未识别到占用程序；最终以 Windows 移除结果为准。')
-                self._log('占用检查完成。')
-            self.run('检查硬盘占用', lambda: self.disks.inspect_disk(disk), done)
+            def work():
+                if elevated and not self.demo:
+                    from .disk_tasks import run_elevated
+                    return run_elevated({'action':'inspect', 'disk':disk})
+                return self.disks.inspect_disk(disk)
+            label = '管理员句柄扫描（请处理 Windows 授权提示）' if elevated else '扫描硬盘文件与磁盘句柄'
+            self.run(label, work, lambda info: self._inspection_result(disk, info, elevated))
 
     def eject(self):
         disk = self.selected_disk()
@@ -499,19 +515,79 @@ class ToolboxApp:
             self.inspect_disk()
             return
         info = self.inspection[1]
-        objects = [p['name'] for p in info.get('processes', [])]
+        objects = [(p['name'] + '（仅关闭目标盘窗口，窗口内其他标签也会关闭）'
+                    if is_explorer(p) else p['name'])
+                   for p in info.get('processes', []) if not p.get('services')]
         objects += ['停止 WSL：' + d for d in info.get('distros', [])]
         objects += [f"卸载：{m['distro']} {m['target']}" for m in info.get('mounts', [])]
-        if objects and not messagebox.askokcancel('正常关闭占用并弹出', '将处理以下占用：\n\n' + '\n'.join(objects) + '\n\n请先保存文件和 WSL 任务。程序弹出保存提示时，请完成保存；不会强制结束程序。', parent=self.root):
+        selected = []
+        if info.get('services'):
+            selected = self._select_services(info['services'], objects)
+            if selected is None:
+                return
+        elif objects and not messagebox.askokcancel('正常关闭占用并弹出', '将处理以下占用：\n\n' + '\n'.join(objects) + '\n\n请先保存文件和 WSL 任务。程序弹出保存提示时，请完成保存；不会强制结束程序。', parent=self.root):
             return
-        self.run('正常释放占用并请求移除', lambda: self.disks.close_and_eject(disk, info), lambda result: self._eject_result(disk, result))
+        elevated = bool(selected) or self.inspection_elevated
+        def work():
+            if elevated and not self.demo:
+                from .disk_tasks import run_elevated
+                return run_elevated({'action':'cleanup','disk':disk,'inspection':info,'selected_services':selected})
+            return self.disks.close_and_eject(disk, info, selected_services=selected)
+        self.run('正常释放已确认占用（可能需要管理员授权）' if elevated else '正常释放占用并请求移除', work, lambda result: self._eject_result(disk, result))
+
+    def _select_services(self, services, objects):
+        dialog = tk.Toplevel(self.root)
+        dialog.title('确认关闭对象与服务')
+        dialog.geometry('760x570')
+        dialog.transient(self.root)
+        tk.Label(dialog, text='服务默认不停止，请勾选本次需要正常停止的服务。', anchor='w', padx=18, pady=14).pack(fill='x')
+        tk.Label(dialog, text='系统核心、驱动、共享宿主或受保护服务只显示原因，不能在此停止。', anchor='w', padx=18, wraplength=710, justify='left').pack(fill='x')
+        body = tk.Frame(dialog)
+        body.pack(fill='both', expand=True, padx=18, pady=12)
+        canvas = tk.Canvas(body, highlightthickness=0)
+        scroll = ttk.Scrollbar(body, command=canvas.yview)
+        scroll.pack(side='right', fill='y')
+        canvas.configure(yscrollcommand=scroll.set)
+        canvas.pack(side='left', fill='both', expand=True)
+        inner = tk.Frame(canvas)
+        canvas.create_window((0, 0), window=inner, anchor='nw')
+        inner.bind('<Configure>', lambda _: canvas.configure(scrollregion=canvas.bbox('all')))
+        choices = []
+        for service in services:
+            variable = tk.BooleanVar(value=False)
+            label = f"{service.get('display_name', service['name'])} [{service['name']}]  PID {service['pid']}"
+            check = ttk.Checkbutton(inner, text=label, variable=variable)
+            check.pack(anchor='w', pady=(6, 0))
+            if not service.get('can_stop'):
+                check.configure(state='disabled')
+            if service.get('reason'):
+                tk.Label(inner, text=service['reason'], wraplength=680, justify='left', fg=MUTED).pack(anchor='w', padx=20)
+            choices.append((service, variable))
+        if objects:
+            tk.Label(inner, text='\n还将请求关闭或释放：\n' + '\n'.join(objects), wraplength=680, justify='left').pack(anchor='w')
+        tk.Label(dialog, text='请先保存文件与 WSL 任务。只请求正常停止，不强杀进程，也不禁用服务。', wraplength=710, justify='left', padx=18).pack(fill='x')
+        selected = [None]
+        def accept():
+            selected[0] = [s for s, var in choices if s.get('can_stop') and var.get()]
+            dialog.destroy()
+        buttons = tk.Frame(dialog)
+        buttons.pack(fill='x', padx=18, pady=14)
+        ttk.Button(buttons, text='取消', command=dialog.destroy).pack(side='right', padx=6)
+        ttk.Button(buttons, text='按所选对象处理并重试', command=accept).pack(side='right')
+        dialog.grab_set()
+        self.root.wait_window(dialog)
+        return selected[0]
 
     def _eject_result(self, disk, result):
+        if result.get('remaining') is not None:
+            self._inspection_result(disk, result['remaining'], self.inspection_elevated)
         success = result.get('success', False)
         label = ', '.join(disk['letters']) + ' · ' + disk['name']
         self.disk_status.set(label + (' 可以拔出' if success else ' 暂时无法弹出'))
         self.disk_detail.set(result.get('message', ''))
         self._log(result.get('message', ''))
+        for outcome in result.get('outcomes', []):
+            self._log(outcome.get('name', '') + '：' + outcome.get('message', ''))
         if success:
             self.inspection = None
             self.disk_tree.selection_remove(*self.disk_tree.selection())

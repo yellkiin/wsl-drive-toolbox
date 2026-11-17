@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "wsl-drive-toolbox"
-version = "0.2.0a1"
+version = "0.2.0a2"
 description = "Universal WSL proxy preview with a stable local gateway and external-drive tools"
 readme = "README.md"
 requires-python = ">=3.10"

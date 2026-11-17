@@ -1,10 +1,10 @@
 # WSL 与移动硬盘工具 · 通用代理预览版
 
-当前 `feature/universal-proxy` 分支提供独立的 **0.2.0a1 预览版**：发现本机代理，通过固定 WSL HTTP 入口供命令行工具使用，并保留移动硬盘诊断和安全弹出功能。
+当前 `feature/universal-proxy` 分支提供独立的 **0.2.0a2 预览版**：发现本机代理，通过固定 WSL HTTP 入口供命令行工具使用，并增加真实文件句柄占用扫描、关联服务诊断和按选择正常释放。
 
 A Windows desktop utility for generic proxy discovery, a stable WSL HTTP gateway, application diagnostics, and external-drive safe ejection. This is an independent preview; source execution uses Python's standard library only.
 
-继续使用原版可下载 [v0.1.0 稳定版](https://github.com/yellkiin/wsl-drive-toolbox/releases/tag/v0.1.0)。本分支后续预览发布目标为 [v0.2.0-preview.1](https://github.com/yellkiin/wsl-drive-toolbox/releases/tag/v0.2.0-preview.1)；发布前请使用源码或 Actions 构建产物。新包名和输出目录与原版分开，便于分别试用。
+继续使用原版可下载 [v0.1.0 稳定版](https://github.com/yellkiin/wsl-drive-toolbox/releases/tag/v0.1.0)。本次预览发布目标为 [v0.2.0-preview.2](https://github.com/yellkiin/wsl-drive-toolbox/releases/tag/v0.2.0-preview.2)；发布前请使用源码或 Actions 构建产物。新包名和输出目录与原版分开，便于分别试用。
 
 ![通用代理页演示界面](docs/images/universal-proxy-demo.png)
 
@@ -40,11 +40,15 @@ WSL 入口 URL 在上游切换时保持不变，后续新连接读取新上游�
 
 ## 安全弹出移动硬盘
 
-![移动硬盘页演示](docs/images/disk-demo.png)
+![硬盘占用扫描演示](docs/images/disk-occupancy-demo.png)
 
-先保存工作，再到移动硬盘页选择目标磁盘，查看型号、容量和同盘的全部盘符，然后点击“安全弹出”。只有界面明确显示 Windows 已允许安全移除时再拔出。
+1. **扫描**：先保存工作，在移动硬盘页核对目标型号、容量和全部盘符，点击“查看占用”。若有无权读取或扫描不完整的提示，可点击“管理员扫描”并处理 Windows UAC 授权；该扫描只读，不关闭程序或停止服务。
+2. **选择**：查看当前进程、打开对象和关联服务，区分单独列出的历史弹出失败记录。点击“正常关闭占用并重试”，核对将处理的程序和 WSL；服务默认不停止，只勾选你明确需要停止且界面允许的服务。
+3. **正常重试**：完成应用自己的保存提示。工具会记录每项处理结果，继续处理其余独立的已确认对象，并刷新剩余占用。只有 Windows 明确允许安全移除后再拔盘；无占用时也可直接点击“安全弹出”。
 
-若系统拒绝移除，先查看占用和拒绝原因。选择“正常关闭占用并重试”前，核对界面列出的程序及 WSL 发行版。应用通过正常窗口关闭请求处理保存对话框，你仍需要完成保存或取消操作。无窗口程序、后台服务或无法确认的占用，可能需要自行退出。
+扫描会检查目标盘文件、目录、卷及原始磁盘的当前 File 类句柄，能识别程序装在内置盘、却打开外接盘对象的情况。关联服务按进程宿主展示，共享宿主不能证明其中每个服务都在访问目标盘。服务仅通过 Windows 服务管理器请求正常停止，不强杀宿主、禁用服务或递归停止依赖服务。
+
+资源管理器只请求关闭指向目标盘的文件夹窗口，不结束整个 Explorer；同一窗口里的其他标签页也可能随窗口关闭。受保护进程、内核及映射文件占用仍可能无法完整归属，扫描没有发现对象也不代表可以拔盘。覆盖范围、管理员权限和历史记录的含义见 [硬盘占用说明](docs/disk-occupancy.md)。
 
 WSL 的 `sync` 仅同步已经写出的文件，不会替应用保存未保存的内容。停止所选发行版会结束其中的任务，请先在对应 WSL 中保存并退出工作。工具不会强制结束程序、强制卸载卷或绕过 Windows 的移除拒绝。
 
@@ -61,7 +65,8 @@ WSL 的 `sync` 仅同步已经写出的文件，不会替应用保存未保存�
 | 关闭代理后网络仍走代理 | WSL autoProxy、TUN、系统路由或其他程序的配置仍可能有效；本工具只管理自己的显式代理配置。 |
 | 新终端生效，旧终端没有变化 | 首次配置或采用新入口后需重开终端/应用；已使用固定入口的进程可在后续新连接中跟随上游切换。 |
 | 入口可用，但某个工具没走代理 | 运行“应用诊断”，检查 `no_proxy`、Git、pip、npm 等独立配置。诊断保留这些设置，不批量删除。 |
-| 磁盘没有列出或无法弹出 | 先确认是可验证的 USB 外接磁盘，再查看诊断信息。复杂卷映射、保护信息不足或 Windows veto 都会阻止自动弹出；请先处理原因。 |
+| 安装在内置盘的程序占用外接盘 | “查看占用”会按打开对象查找，不只检查程序安装目录；有无权读取时可使用只读“管理员扫描”。 |
+| 磁盘没有列出或无法弹出 | 查看当前占用、扫描覆盖和系统拒绝原因。历史 Kernel-PnP 225 记录不等于当前占用；复杂卷映射、保护信息不足或 Windows veto 都会阻止自动弹出。 |
 
 支持 Bash、Zsh 的用户配置。APT、systemd 服务、Docker 容器及所有已运行进程的代理不在自动配置范围内。
 
@@ -103,7 +108,7 @@ python -m pip install ".[build]"
 powershell -ExecutionPolicy Bypass -File scripts/build-universal.ps1
 ```
 
-预览输出为 `dist-universal/WSL-Drive-Toolbox-Universal/`，启动其中的 `WSL-Drive-Toolbox-Universal.exe`，不会改写原有 `dist/`。请分发整个文件夹，不能只复制 EXE。打包包含 Windows Python 运行环境及三个 WSL helper 源文件；目标 WSL 仍需 `python3`。EXE 为无控制台 GUI 程序，命令行输出请使用源码入口。
+预览输出为 `dist-universal/WSL-Drive-Toolbox-Universal/`，启动其中的 `WSL-Drive-Toolbox-Universal.exe`，不会改写原有 `dist/`。请分发整个文件夹，不能只复制 EXE。打包包含 Windows Python 运行环境、原生句柄扫描与管理员助手，以及三个 WSL helper 源文件；目标 WSL 仍需 `python3`。占用扫描无需安装第三方工具或驱动。EXE 为无控制台 GUI 程序，命令行输出请使用源码入口。
 
 通用 `scripts/build.ps1` 仍默认输出 `dist/WSL-Drive-Toolbox/`，也接受 `-Name` 和 `-DistPath`。在当前分支运行它会打包当前预览源码；如需原版，请使用 v0.1.0 发布资产或相应源码。
 

@@ -4,6 +4,7 @@ __pycache__/
 build/
 dist/
 dist-universal/
+dist-preview2/
 *.spec
 .local/
 .superpowers/
