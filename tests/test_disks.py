@@ -525,7 +525,10 @@ function New-Object {
                 adapter.kernel.QueryFullProcessImageNameW = query_image
                 adapter.kernel.WaitForSingleObject = lambda *_: 0
                 windows.EnumWindows = lambda callback, _: [callback(hwnd, 0) for hwnd in sorted(windows.alive)]
-                result = adapter.close_process({"pid": 42, "created": 900, "name": "Windows Explorer"})
+                # EnumWindows is a Python fake, so Linux needs no Windows ABI.
+                callback_factory = getattr(disk_native.C, "WINFUNCTYPE", disk_native.C.CFUNCTYPE)
+                with patch.object(disk_native.C, "WINFUNCTYPE", callback_factory, create=True):
+                    result = adapter.close_process({"pid": 42, "created": 900, "name": "Windows Explorer"})
                 self.assertEqual(result, allowed)
                 self.assertEqual(bool(windows.posted), allowed)
                 self.assertEqual(queried_handles, [99])
