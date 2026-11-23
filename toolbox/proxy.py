@@ -86,6 +86,14 @@ def list_users(distro):
     return sorted(set(users)) + (['root'] if any(line.startswith('root:') for line in output.splitlines()) else [])
 
 
+def default_user(distro):
+    try:
+        return _run(['wsl.exe', '--distribution', distro, '--exec', 'id', '-un']).strip()
+    except RuntimeError:
+        # Reading the default is optional when an explicit account is available.
+        return ''
+
+
 def _target(distro, user):
     if not distro or not user:
         raise ValueError('请明确选择 WSL 发行版和 Linux 用户；不会自动修改 root。')
@@ -366,9 +374,9 @@ def scan(distro, user, extended=False):
                     unconfirmed=max(0, coverage['total'] - coverage['completed']))
     coverage['partial'] = bool(coverage['unconfirmed'] or coverage['pending'])
     if setting.get('pac'):
-        issues.append('检测到 PAC：首版不执行 PAC，请手动指定无认证代理入口。')
+        issues.append('检测到 PAC 自动配置脚本，请手动指定无认证的代理地址。')
     if setting.get('enabled') and setting.get('server') and not system_endpoints(setting) and not setting.get('pac'):
-        issues.append('系统代理包含不支持或认证地址；首版不收集代理凭据。')
+        issues.append('系统代理地址使用了不支持的格式或需要认证，请手动指定无认证的代理地址。')
     if not any(row.get('verified') for row in candidates):
         issues.append('未确认可用代理；仅 TUN/VPN 模式须由其自身提供 WSL 路由，或启用显式 HTTP/SOCKS5 入口。NAT 模式需要可达监听地址；不会自动开放防火墙。')
     selected, reason = select_candidate(candidates, setting)

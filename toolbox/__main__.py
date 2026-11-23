@@ -6,6 +6,8 @@ import sys
 
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
+    if not argv and getattr(sys, 'frozen', False):
+        argv = ['--quick-connect']
     if argv and argv[0] == '--internal-handle-worker':
         from .disk_handles import worker_main
         return worker_main(*argv[1:])
@@ -15,6 +17,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description='WSL 与移动硬盘工具箱')
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument('--demo', action='store_true', help='使用演示数据打开界面，不操作系统')
+    mode.add_argument('--quick-connect', action='store_true', help='使用上次选择的 WSL 账号，重新检测并连接当前代理')
     mode.add_argument('--cli', choices=['status', 'scan', 'connect', 'off', 'rollback', 'diagnose', 'apps'])
     parser.add_argument('--distro')
     parser.add_argument('--user')
@@ -24,7 +27,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if not args.cli:
         from .app import launch
-        launch(demo=args.demo)
+        launch(demo=args.demo, quick_connect=args.quick_connect)
         return 0
     from . import proxy
     try:

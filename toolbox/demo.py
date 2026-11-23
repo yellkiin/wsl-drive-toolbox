@@ -9,6 +9,9 @@ class DemoProxy:
     def list_users(self, distro):
         return ['developer']
 
+    def default_user(self, distro):
+        return 'developer'
+
     def scan(self, distro, user, extended=False):
         c = {'app': 'Local Proxy', 'host': '127.0.0.1', 'port': 8080, 'protocol':'http', 'verified':True, 'pid': 1234, 'created': 'demo'}
         other = {'app':'SOCKS Service','host':'127.0.0.1','port':1080,'protocol':'socks5','verified':True,'pid':1235,'created':'demo'}

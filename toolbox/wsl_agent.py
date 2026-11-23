@@ -13,6 +13,7 @@ from pathlib import Path
 import re
 import secrets
 import shlex
+import shutil
 import socket
 import ssl
 import subprocess
@@ -123,26 +124,77 @@ def edit_env(data, url):
     return result.encode('utf-8')
 
 
+def known_legacy_proxy(legacy):
+    content = (legacy or b'').decode('utf-8', errors='replace')
+    commands = [s.strip() for s in content.splitlines() if s.strip() and not s.lstrip().startswith('#')]
+    if commands == ['unset ' + ' '.join(KEYS)]:
+        return content.startswith(LEGACY_MARKERS)
+    # Early installations used the same eight proxy exports without a tool marker.
+    expected_tail = ['export ' + key + '="$http_proxy"' for key in KEYS[1:]] + [
+        'export no_proxy="${no_proxy:-${NO_PROXY:-localhost,127.0.0.1,::1,[::1]}}"',
+        'export NO_PROXY="$no_proxy"',
+    ]
+    if not commands or not re.fullmatch(r'export http_proxy="http://127\.0\.0\.1:[0-9]{1,5}"', commands[0]):
+        return False
+    if content.startswith(LEGACY_MARKERS):
+        return all(line in expected_tail for line in commands[1:])
+    return commands[1:] == expected_tail
+
+
+def contains_legacy_source(line):
+    lexer = shlex.shlex(line, posix=True, punctuation_chars=';&|()')
+    lexer.whitespace_split = True
+    try:
+        words = list(lexer)
+    except ValueError:
+        # A multi-line command cannot be safely edited as a single source line.
+        return bool(re.search(r'(?:^|[;&|]\s*)(?:source|\.)\s+.*?/\.config/proxy/7897\.sh\b', line.lstrip()))
+    for i, (word, target) in enumerate(zip(words, words[1:])):
+        if word in ('.', 'source') and target.endswith('/.config/proxy/7897.sh'):
+            if (i == 0 or words[i - 1] in ('then', 'else', 'do', 'if', 'while', 'until', '{', '!', 'command', 'builtin')
+                    or re.fullmatch(r'[;&|()]+', words[i - 1])):
+                return True
+    return False
+
+
 def migrate_legacy(data, legacy):
     text = (data or b'').decode('utf-8')
     if '7897.sh' not in text:
         return data
-    content = (legacy or b'').decode('utf-8')
-    known = content.startswith(LEGACY_MARKERS) and all(
-        not line.strip() or line.lstrip().startswith(('#', 'export ', 'unset '))
-        for line in content.splitlines())
-    if not known:
+    path = r'(?:\$\{HOME\}|\$HOME)/\.config/proxy/7897\.sh'
+    path = rf'(?:{path}|"{path}"|~/\.config/proxy/7897\.sh)'
+    readable = rf'\[[ \t]+-[rfe][ \t]+{path}[ \t]+\]'
+    source = rf'(?:source|\.)[ \t]+{path}'
+    guarded = rf'(?:{readable}[ \t]*&&[ \t]*)?{source}'
+    conditional = rf'if[ \t]+{readable};[ \t]*then[ \t]+{source};[ \t]*fi'
+    hook = re.compile(rf'^([ \t]*)(?:{guarded}|{conditional})(;?(?:[ \t]+#[^\r\n]*)?[ \t]*\r?)$', re.M)
+    for line in text.splitlines():
+        if '7897.sh' in line and not hook.fullmatch(line) and contains_legacy_source(line):
+            raise RuntimeError('启动文件含自定义的旧代理 source 语句，请核对该行后重试。')
+    if not hook.search(text):
+        return data
+    if not known_legacy_proxy(legacy):
         raise RuntimeError('启动文件引用了未知的旧 7897.sh；请手动处理该引用后重试，原文件未更改。')
-    # Replace only the sourcing command, retaining surrounding if/&& syntax.
-    source = re.compile(r'''(?:source|\.)\s+["']?(?:\$\{HOME\}|\$HOME|~)/\.config/proxy/7897\.sh["']?''')
-    lines = []
-    for line in text.splitlines(keepends=True):
-        if '7897.sh' in line and not line.lstrip().startswith('#'):
-            line, count = source.subn(':', line)
-            if not count and re.search(r'(?:source|\.)\s', line):
-                raise RuntimeError('无法识别旧代理的 source 语句，请先手动处理。')
-        lines.append(line)
-    return ''.join(lines).encode()
+    # A no-op keeps an enclosing multi-line shell conditional syntactically valid.
+    return hook.sub(r'\g<1>:\g<2>', text).encode()
+
+
+def local_git_endpoints(managed_shell, legacy, configs):
+    """Only positively identified local upstreams may replace a personal Git override."""
+    endpoints = set()
+    for script in (managed_shell, legacy if known_legacy_proxy(legacy) else None):
+        match = re.search(rb'''^export http_proxy=["']?([^\s"']+)["']?\s*$''', script or b'', re.M)
+        if match:
+            endpoints.add(match[1])
+    for config in configs:
+        upstream = (config or {}).get('upstream')
+        if upstream:
+            host = upstream['host']
+            host = f'[{host}]' if ':' in host else host
+            endpoints.add(f"{upstream['protocol']}://{host}:{upstream['port']}".encode())
+    local = {url.lower() for url in endpoints if re.fullmatch(
+        rb'(?:https?|socks5h?)://(?:127\.0\.0\.1|localhost|\[::1\]):[0-9]+', url, re.I)}
+    return local | {url + b'/' for url in local}
 
 
 class Manager:
@@ -193,6 +245,49 @@ class Manager:
     def transactions(self):
         return sorted(self.backups.glob('*/manifest.json')) if self.backups.exists() else []
 
+    def migrate_git(self, before, desired, endpoints):
+        if 'GIT_CONFIG_GLOBAL' in os.environ or not shutil.which('git'):
+            return ''
+        xdg = Path(os.environ.get('XDG_CONFIG_HOME') or self.home / '.config')
+        paths = [self.home / '.gitconfig']
+        if xdg.is_absolute() and self.home in (xdg / 'git/config').parents:
+            paths.append(xdg / 'git/config')
+        updates = {}
+        direct_values = []
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                copy = Path(directory) / 'gitconfig'
+                cmd = ['git', 'config', '--file', str(copy), '--no-includes']
+                for path in paths:
+                    self.check_paths([path])
+                    original = read(path)
+                    if not original:
+                        continue
+                    copy.write_bytes(original)
+                    result = subprocess.run(cmd + ['--null', '--get-all', 'http.proxy'], capture_output=True, timeout=5)
+                    if result.returncode == 1:  # Key absent in this file.
+                        continue
+                    result.check_returncode()
+                    values = result.stdout.split(b'\0')[:-1]
+                    if not values or any(value.lower() not in endpoints for value in values):
+                        return 'Git 保留了独立的 http.proxy，可用「工具联网检查」确认路径。'
+                    subprocess.run(cmd + ['--unset-all', 'http.proxy'], capture_output=True, check=True, timeout=5)
+                    updates[path] = (original, copy.read_bytes())
+                    direct_values.extend(values)
+            if updates:
+                # Removing an override could expose a lower-precedence system or included proxy.
+                result = subprocess.run(['git', 'config', '--includes', '--null', '--get-all', 'http.proxy'],
+                                        cwd=self.home, env=dict(os.environ, HOME=str(self.home)),
+                                        capture_output=True, check=True, timeout=5)
+                if sorted(result.stdout.split(b'\0')[:-1]) != sorted(direct_values):
+                    return 'Git 的其他配置来源也设置了 http.proxy，已保留原设置。'
+        except (OSError, RuntimeError, subprocess.SubprocessError):
+            return '未能检查个人 Git 配置，可用「工具联网检查」确认路径。'
+        for path, (original, modified) in updates.items():
+            before[path] = original
+            desired[path] = modified
+        return 'Git 已移除指向已知本地代理的 http.proxy，将跟随终端。' if updates else ''
+
     def apply(self, url, codex=False, verify=True, extra_files=None, gateway_mode=False, verify_connection=None):
         validate_url(url)
         with self.lock():
@@ -213,12 +308,18 @@ class Manager:
             before = {path: read(path) for path in targets}
             if before[self.shell] and not before[self.shell].startswith(SHELL_MARK.encode()):
                 raise RuntimeError('代理管理文件含未知内容，未覆盖。')
-            desired = {path: managed_block(migrate_legacy(before[path], read(legacy))) for path in files}
+            legacy_content = read(legacy)
+            desired = {path: managed_block(migrate_legacy(before[path], legacy_content)) for path in files}
             desired[self.shell] = shell_content(url, gateway_mode)
             desired.update(extra_files)
             if codex:
                 env = self.home / '.codex/.env'
                 desired[env] = edit_env(before[env], url)
+            attempted_gateway = json.loads(extra_files[self.home / gateway.CONFIG]) if gateway and self.home / gateway.CONFIG in extra_files else previous_gateway
+            git_notice = ''
+            if gateway_mode:
+                endpoints = local_git_endpoints(before[self.shell], legacy_content, (previous_gateway, attempted_gateway))
+                git_notice = self.migrate_git(before, desired, endpoints)
             if desired == before:
                 if gateway:
                     gateway.reconcile(self.home, previous_gateway)
@@ -226,7 +327,8 @@ class Manager:
                     verify_connection()
                 if verify:
                     verify_environment(self.home, url)
-                return {'message': '配置已经相同；新 shell 环境已验证。' if verify else '配置已经相同。'}
+                message = '配置已经相同；新 shell 环境已验证。' if verify else '配置已经相同。'
+                return {'message': message + git_notice, 'git_notice': git_notice}
             self.backups.mkdir(parents=True, exist_ok=True)
             folder = self.backups / (str(time.time_ns()) + '-' + secrets.token_hex(3))
             folder.mkdir(mode=0o700)
@@ -241,7 +343,6 @@ class Manager:
             manifest_path = folder / 'manifest.json'
             self.save_manifest(manifest_path, manifest)
             changed = []
-            attempted_gateway = json.loads(extra_files[self.home / gateway.CONFIG]) if gateway and self.home / gateway.CONFIG in extra_files else previous_gateway
             try:
                 for path, data in desired.items():
                     if read(path) != before[path]:
@@ -279,7 +380,8 @@ class Manager:
                 raise
             return {'message': ('显式代理已关闭' if url is None else '代理配置已写入') +
                     ('，新的登录/交互 shell 环境已验证。' if verify else '。') +
-                    (' Codex .env 已同步；现有进程需要重新启动。' if codex else '')}
+                    (' Codex .env 已同步；现有进程需要重新启动。' if codex else '') + git_notice,
+                    'git_notice': git_notice}
 
     @staticmethod
     def save_manifest(path, manifest):

@@ -162,6 +162,57 @@ class ConfigurationTests(unittest.TestCase):
         self.manager.rollback()
         self.assertEqual((self.home / '.bashrc').read_text(), old)
 
+    def test_unmarked_legacy_template_from_older_installs(self):
+        legacy = self.home / '.config/proxy/7897.sh'
+        legacy.parent.mkdir(parents=True)
+        script = (
+            '# Local WSL proxy\n'
+            'export http_proxy="http://127.0.0.1:7897"\n'
+            'export https_proxy="$http_proxy"\n'
+            'export HTTP_PROXY="$http_proxy"\n'
+            'export HTTPS_PROXY="$http_proxy"\n'
+            'export all_proxy="$http_proxy"\n'
+            'export ALL_PROXY="$http_proxy"\n\n'
+            'export no_proxy="${no_proxy:-${NO_PROXY:-localhost,127.0.0.1,::1,[::1]}}"\n'
+            'export NO_PROXY="$no_proxy"\n'
+        ).encode()
+        legacy.write_bytes(script)
+        hook = b'[ -r "$HOME/.config/proxy/7897.sh" ] && . "$HOME/.config/proxy/7897.sh"\n'
+        for name in ('.bashrc', '.profile'):
+            (self.home / name).write_bytes(hook)
+        self.apply()
+        self.apply()
+        for name in ('.bashrc', '.profile'):
+            content = (self.home / name).read_bytes()
+            self.assertNotIn(b'7897.sh', content)
+            self.assertEqual(content.count(agent.START.encode()), 1)
+        self.assertEqual(legacy.read_bytes(), script)
+        self.manager.rollback()
+        for name in ('.bashrc', '.profile'):
+            self.assertEqual((self.home / name).read_bytes(), hook)
+
+        legacy.write_bytes(script + b'export CUSTOM=value\n')
+        with self.assertRaisesRegex(RuntimeError, '未知'):
+            self.apply()
+        self.assertEqual((self.home / '.bashrc').read_bytes(), hook)
+
+    def test_legacy_filename_mentions_are_preserved(self):
+        original = (b'# source ~/.config/proxy/7897.sh\n'
+                    b'echo "source ~/.config/proxy/7897.sh"\n'
+                    b'source ~/.config/proxy/7897.sh.bak\n')
+        self.assertEqual(agent.migrate_legacy(original, None), original)
+        marked = b'# Managed by the desktop WSL Proxy Switcher.\n'
+        self.assertEqual(agent.migrate_legacy(original, marked), original)
+
+    def test_one_line_legacy_conditional_and_unhandled_compound(self):
+        path = b'"$HOME/.config/proxy/7897.sh"'
+        marked = b'# WSL Proxy Switcher: disabled for newly opened shells.\nunset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY\n'
+        conditional = b'if [ -f ' + path + b' ]; then source ' + path + b'; fi # old\r\n'
+        self.assertEqual(agent.migrate_legacy(conditional, marked), b': # old\r\n')
+        for line in (b'. ' + path + b' && echo ok', b'if custom; then . ' + path + b'; fi'):
+            with self.subTest(line=line), self.assertRaisesRegex(RuntimeError, 'source'):
+                agent.migrate_legacy(line, marked)
+
     def test_corrupted_backup_is_rejected(self):
         (self.home / '.bashrc').write_text('# original\n')
         self.apply()
@@ -225,6 +276,59 @@ class GatewayTransactionTests(unittest.TestCase):
         plan = agent.gateway.prepare(self.home, dict(host='127.0.0.1', port=19000, protocol='http'))
         self.manager.apply(plan['url'], verify=False, extra_files=plan['files'], gateway_mode=True)
         return plan
+
+    @unittest.skipUnless(shutil.which('git'), 'Requires Git')
+    def test_personal_git_proxy_inherits_gateway_and_rolls_back(self):
+        legacy = self.home / '.config/proxy/7897.sh'
+        legacy.parent.mkdir(parents=True)
+        legacy.write_bytes(b'# Managed by the desktop WSL Proxy Switcher.\nexport http_proxy="http://127.0.0.1:23194"\n')
+        xdg = self.home / 'user-config'
+        config = xdg / 'git/config'
+        config.parent.mkdir(parents=True)
+        original = (b'[http]\n\tproxy = http://127.0.0.1:23194/\n'
+                    b'[http "https://internal.example"]\n\tproxy = http://localhost:23195\n'
+                    b'[include]\n\tpath = ../other.config\n')
+        config.write_bytes(original)
+        other = xdg / 'other.config'
+        other.write_bytes(b'[http "https://other.example"]\n\tproxy = http://localhost:23195\n')
+        with mock.patch.dict(os.environ, {'XDG_CONFIG_HOME': str(xdg)}):
+            self.connect()
+        self.assertNotIn(b'23194', config.read_bytes())
+        self.assertIn(b'23195', config.read_bytes())
+        self.assertIn(b'../other.config', config.read_bytes())
+        self.assertIn(b'23195', other.read_bytes())
+        self.manager.rollback()
+        self.assertEqual(config.read_bytes(), original)
+
+    @unittest.skipUnless(shutil.which('git'), 'Requires Git')
+    def test_git_removal_does_not_reactivate_proxy_in_an_included_file(self):
+        config = self.home / '.gitconfig'
+        original = b'[include]\n\tpath = other.config\n[http]\n\tproxy = http://127.0.0.1:19000\n'
+        config.write_bytes(original)
+        other = self.home / 'other.config'
+        other.write_bytes(b'[http]\n\tproxy = http://other.example:3128\n')
+        self.connect()
+        self.assertEqual(config.read_bytes(), original)
+
+    @unittest.skipUnless(shutil.which('git'), 'Requires Git')
+    def test_only_matching_personal_unscoped_git_settings_migrate(self):
+        config = self.home / '.gitconfig'
+        original = b'[http]\n\tproxy = http://127.0.0.1:19000\n'
+        config.write_bytes(original)
+        self.connect()
+        self.assertNotIn(b'19000', config.read_bytes())
+        self.manager.rollback()
+        for value in (b'http://127.0.0.1:19009', b'http://user:secret@127.0.0.1:19000',
+                      b'http://corporate.example:19000', b'', b'http://127.0.0.1:19000\n\tproxy = '):
+            with self.subTest(value=value):
+                data = b'[http]\n\tproxy = ' + value + b'\n'
+                config.write_bytes(data)
+                self.connect()
+                self.assertEqual(config.read_bytes(), data)
+        config.write_bytes(original)
+        with mock.patch.dict(os.environ, {'GIT_CONFIG_GLOBAL': str(self.home / 'custom-git')}):
+            self.connect()
+        self.assertEqual(config.read_bytes(), original)
 
     def test_gateway_files_shell_and_process_rollback_together(self):
         self.connect()

@@ -18,7 +18,7 @@ TEAL = '#087f83'
 
 
 class ToolboxApp:
-    def __init__(self, root, demo=False, proxy_service=None, disk_service=None, autoload=True):
+    def __init__(self, root, demo=False, proxy_service=None, disk_service=None, autoload=True, quick_connect=False):
         self.root, self.demo = root, demo
         if demo:
             from .demo import DemoProxy, DemoDisks
@@ -47,11 +47,11 @@ class ToolboxApp:
         self.poll_id = self.root.after(80, self._drain)
         self.root.protocol('WM_DELETE_WINDOW', self._close)
         if autoload:
-            self.root.after(150, self.refresh_distros)
+            self.root.after(150, lambda: self.refresh_distros(quick_connect=quick_connect))
 
     def _build(self):
         r = self.root
-        r.title('WSL 工具箱 · 通用预览' + (' · 演示' if self.demo else ''))
+        r.title('WSL 与移动硬盘工具箱' + (' · 演示' if self.demo else ''))
         r.geometry('1120x800')
         r.minsize(1000, 760)
         r.configure(bg=BG)
@@ -123,7 +123,10 @@ class ToolboxApp:
         card = self.card(parent)
         tk.Label(card, text='工作环境', bg='white', fg=INK, font=('Microsoft YaHei UI', 11, 'bold')).grid(row=0, column=0, sticky='w', columnspan=4, pady=(0, 13))
         for col, text in [(0, 'WSL 发行版'), (1, 'Linux 用户'), (2, '按程序筛选')]:
-            tk.Label(card, text=text, bg='white', fg=MUTED, font=('Microsoft YaHei UI', 9)).grid(row=1, column=col, sticky='w', padx=(0, 12), pady=(0, 5))
+            label = tk.Label(card, text=text, bg='white', fg=MUTED, font=('Microsoft YaHei UI', 9))
+            label.grid(row=1, column=col, sticky='w', padx=(0, 12), pady=(0, 5))
+            if col == 1:
+                self.user_label = label
         self.distro_combo = self.combo(card, self.distro, width=22)
         self.distro_combo.grid(row=2, column=0, sticky='ew', padx=(0, 12))
         self.distro_combo.bind('<<ComboboxSelected>>', lambda _: self.target_changed(new_distro=True))
@@ -284,32 +287,49 @@ class ToolboxApp:
         self._remember()
         return distro, user
 
-    def refresh_distros(self):
+    def refresh_distros(self, quick_connect=False):
         def done(rows):
             names = [r['name'] for r in rows]
             self.distro_combo['values'] = names
             if self.distro.get() not in names:
                 self.distro.set(next((r['name'] for r in rows if r.get('default')), names[0] if names else ''))
                 self.user.set('')
-            if self.user.get():
+                self.user_label.configure(text='Linux 用户')
+                self.user_combo['values'] = []
+            if self.user.get() and not self.user_combo['values']:
                 self.user_combo['values'] = [self.user.get()]
             self.proxy_status.set('准备连接你的 WSL' if names else '尚未发现 WSL 发行版')
             self._log('已发现 ' + str(len(names)) + ' 个 WSL 发行版。')
+            if quick_connect and names:
+                self.family.set('自动选择')
+                if self.user.get() and self.user.get() != 'root':
+                    self.refresh_users(quick_connect=True)
+                else:
+                    self.proxy_detail.set('请选择发行版，点击「读取用户」，选择日常使用的账号后点「一键连接 WSL」。')
         self.run('读取 WSL 发行版', self.proxy.list_distros, done)
 
-    def refresh_users(self):
+    def refresh_users(self, quick_connect=False):
         distro = self.distro.get()
         if not distro:
             return
         self.candidates = []
         self.proxy_tree.delete(*self.proxy_tree.get_children())
-        def done(users):
+        def done(result):
+            users, default = result
             self.user_combo['values'] = users
+            self.user_label.configure(text='Linux 用户' + (' · 默认登录 ' + default if default else ''))
+            if quick_connect and self.user.get() in users and self.user.get() != 'root':
+                self.connect()
+                return
             if self.user.get() not in users:
                 normal = [u for u in users if u != 'root']
-                self.user.set(normal[0] if len(normal) == 1 else '')
-            self.proxy_detail.set('请选择日常使用的 Linux 用户；此操作可能启动所选发行版。')
-        self.run('读取 Linux 用户（可能启动所选 WSL）', lambda: self.proxy.list_users(distro), done)
+                if default in normal:
+                    self.user.set(default)
+                else:
+                    self.user.set(normal[0] if len(normal) == 1 else '')
+            self.proxy_detail.set('请选择运行命令或 Codex 的账号。打开平时用的 WSL 终端，输入 whoami 可查看用户名。代理配置只对所选账号生效。')
+        self.run('读取 Linux 用户（可能启动所选 WSL）',
+                 lambda: (self.proxy.list_users(distro), self.proxy.default_user(distro)), done)
 
     def target_changed(self, new_distro=False):
         self.candidates = []
@@ -318,6 +338,7 @@ class ToolboxApp:
         self.proxy_detail.set('点击「一键连接 WSL」检测并应用当前代理。')
         if new_distro:
             self.user.set('')
+            self.user_label.configure(text='Linux 用户')
             self.user_combo['values'] = []
             self.refresh_users()
 
@@ -330,13 +351,13 @@ class ToolboxApp:
         if self.family.get() != '自动选择':
             self.candidates = [c for c in self.candidates if c['app'] == self.family.get()]
             selected = self.candidates[0] if len(self.candidates) == 1 and self.candidates[0].get('verified', True) else None
-            reason = '已筛选 ' + self.family.get() + '；点击连接，或从列表中选择端口。'
+            reason = '已筛选 ' + self.family.get() + '。点击连接，或从列表中选择端口。'
+        if selected:
+            reason = f"本次检测推荐 {selected['app']}（{selected['host']}:{selected['port']}）。" + reason
         self.proxy_tree.delete(*self.proxy_tree.get_children())
         for i, c in enumerate(self.candidates):
             verified = c.get('verified', True)
             self.proxy_tree.insert('', 'end', iid=str(i), values=(c['app'], c.get('protocol', 'http').upper(), f"{c['host']}:{c['port']}", '转发验证通过' if verified else '未确认 · 连接时验证'))
-            if c == selected:
-                self.proxy_tree.selection_set(str(i))
         self.proxy_status.set(f'发现 {len(self.candidates)} 个代理候选' if self.candidates else '没有找到可确认的代理')
         self.proxy_detail.set(reason or '选中一行后点击「一键连接 WSL」。')
         for issue in result.get('issues', []):
@@ -369,6 +390,8 @@ class ToolboxApp:
         if c:
             lines.append(f"上游：{c['app']} · {c.get('protocol', 'http').upper()} · {c['host']}:{c['port']}")
         lines.append(network.get('message') or result.get('message', '请打开新终端加载代理。'))
+        if result.get('git_notice'):
+            lines.append(result['git_notice'])
         self.proxy_detail.set('\n'.join(lines))
         self._log(result.get('message', '已完成'))
         self.candidates = []
@@ -402,7 +425,7 @@ class ToolboxApp:
         self._log(result.get('message', ''))
 
     def manual(self):
-        address = simpledialog.askstring('手动代理地址', '输入 http://主机:端口、https://主机:端口 或 socks5://主机:端口。\n也可只输入本机端口。此预览版不接收账号密码。', parent=self.root)
+        address = simpledialog.askstring('手动代理地址', '输入无认证的 http://主机:端口、https://主机:端口 或 socks5://主机:端口。\n也可只输入本机端口。', parent=self.root)
         if not address:
             return
         address = address.strip()
@@ -422,7 +445,7 @@ class ToolboxApp:
         self.proxy_status.set('应用联网检查完成')
         self.proxy_detail.set(result.get('message', ''))
         window = tk.Toplevel(self.root)
-        window.title('工具联网检查 · 通用预览')
+        window.title('工具联网检查')
         window.geometry('820x620')
         body = tk.Text(window, wrap='word', padx=20, pady=16, font=('Microsoft YaHei UI', 10), bg='white', fg=INK)
         scrollbar = ttk.Scrollbar(window, command=body.yview)
@@ -601,7 +624,7 @@ class ToolboxApp:
         self.root.destroy()
 
 
-def launch(demo=False):
+def launch(demo=False, quick_connect=False):
     root = tk.Tk()
-    ToolboxApp(root, demo=demo)
+    ToolboxApp(root, demo=demo, quick_connect=quick_connect)
     root.mainloop()

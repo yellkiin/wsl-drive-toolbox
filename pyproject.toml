@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "wsl-drive-toolbox"
-version = "0.2.0a2"
-description = "Universal WSL proxy preview with a stable local gateway and external-drive tools"
+version = "0.2.0"
+description = "Connect WSL to the current Windows proxy and safely eject external drives"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}

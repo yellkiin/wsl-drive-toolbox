@@ -66,6 +66,90 @@ class AppTests(unittest.TestCase):
         self.assertTrue(bounds, 'first candidate must be visible')
         self.assertLessEqual(bounds[1] + bounds[3], self.app.proxy_tree.winfo_height())
 
+    def test_scan_recommendation_does_not_pin_upstream_but_manual_selection_does(self):
+        self.app.distro.set('Ubuntu')
+        self.app.user.set('developer')
+        fresh = self.app.proxy.scan('Ubuntu', 'developer')
+        self.app._scan_result(fresh)
+        self.assertIn(fresh['selected']['app'], self.app.proxy_detail.get())
+        self.assertFalse(self.app.proxy_tree.selection())
+        with patch.object(self.app, 'run', side_effect=lambda _, work, done: work()), \
+             patch.object(self.app.proxy, 'connect') as connect:
+            self.app.connect()
+            connect.assert_called_with('Ubuntu', 'developer', candidate=None, family=None, codex=False)
+            self.app.proxy_tree.selection_set('1')
+            self.app.connect()
+            connect.assert_called_with('Ubuntu', 'developer', candidate=fresh['candidates'][1], family=None, codex=False)
+            self.app._scan_result(fresh)
+            self.assertFalse(self.app.proxy_tree.selection())
+
+    def test_connection_card_shows_git_notice_and_keeps_controls_visible(self):
+        notice = 'Git 的个人代理已迁移到固定入口。'
+        result = self.app.proxy.connect('Ubuntu', 'developer')
+        self.app._connected(dict(result, git_notice=notice))
+        self.root.update()
+        self.assertIn(notice, self.app.proxy_detail.get().splitlines())
+        button = next(c for c, _ in self.app.controls if c.cget('text') == '一键连接 WSL')
+        self.assertTrue(button.winfo_ismapped())
+        self.assertLess(button.winfo_rooty() + button.winfo_height(), self.app.proxy_tree.winfo_rooty())
+
+    def test_quick_connect_uses_saved_account_and_fresh_automatic_proxy(self):
+        self.app.distro.set('Ubuntu')
+        self.app.user.set('alice')
+        self.app.family.set('Old proxy')
+        self.app.codex.set(True)
+        with patch.object(self.app, 'run', side_effect=lambda _, work, done: done(work())), \
+             patch.object(self.app.proxy, 'list_distros', return_value=[{'name': 'Ubuntu'}]), \
+             patch.object(self.app.proxy, 'list_users', return_value=['alice', 'root']), \
+             patch.object(self.app.proxy, 'connect', return_value={}) as connect:
+            self.app.refresh_distros(quick_connect=True)
+        connect.assert_called_once_with('Ubuntu', 'alice', candidate=None, family=None, codex=True)
+
+    def test_quick_connect_waits_for_selection_on_missing_changed_or_root_account(self):
+        for distro, user in [('', ''), ('Gone', 'alice'), ('Ubuntu', 'gone'), ('Ubuntu', 'root')]:
+            with self.subTest(distro=distro, user=user):
+                self.app.distro.set(distro)
+                self.app.user.set(user)
+                with patch.object(self.app, 'run', side_effect=lambda _, work, done: done(work())), \
+                     patch.object(self.app.proxy, 'list_distros', return_value=[{'name': 'Ubuntu'}]), \
+                     patch.object(self.app.proxy, 'list_users', return_value=['alice', 'root']), \
+                     patch.object(self.app.proxy, 'connect') as connect:
+                    self.app.refresh_distros(quick_connect=True)
+                connect.assert_not_called()
+
+    def test_read_users_displays_default_and_preserves_explicit_selection(self):
+        self.app.distro.set('Ubuntu')
+        with patch.object(self.app, 'run', side_effect=lambda _, work, done: done(work())), \
+             patch.object(self.app.proxy, 'list_users', return_value=['alice', 'sam', 'root']), \
+             patch.object(self.app.proxy, 'default_user', return_value='sam'):
+            self.app.refresh_users()
+            self.assertEqual(self.app.user.get(), 'sam')
+            self.assertIn('默认登录', self.app.user_label.cget('text'))
+            self.assertIn('sam', self.app.user_label.cget('text'))
+            self.app.user.set('alice')
+            self.app.refresh_users()
+            self.assertEqual(self.app.user.get(), 'alice')
+
+    def test_quick_connect_does_not_switch_to_a_different_default_user(self):
+        self.app.user.set('gone')
+        self.app.distro.set('Ubuntu')
+        with patch.object(self.app, 'run', side_effect=lambda _, work, done: done(work())), \
+             patch.object(self.app.proxy, 'list_users', return_value=['alice', 'sam', 'root']), \
+             patch.object(self.app.proxy, 'default_user', return_value='sam'), \
+             patch.object(self.app.proxy, 'connect') as connect:
+            self.app.refresh_users(quick_connect=True)
+            self.assertEqual(self.app.user.get(), 'sam')
+            connect.assert_not_called()
+
+    def test_default_root_is_not_preselected(self):
+        self.app.distro.set('Ubuntu')
+        with patch.object(self.app, 'run', side_effect=lambda _, work, done: done(work())), \
+             patch.object(self.app.proxy, 'list_users', return_value=['alice', 'sam', 'root']), \
+             patch.object(self.app.proxy, 'default_user', return_value='root'):
+            self.app.refresh_users()
+            self.assertEqual(self.app.user.get(), '')
+            self.assertIn('默认登录', self.app.user_label.cget('text'))
+
     def test_unknown_process_is_selectable_and_unverified_row_not_labeled_passed(self):
         row = {'app':'AnyProxy','host':'proxy.example','port':8080,'protocol':'http','verified':False,'source':'system'}
         self.app._scan_result({'candidates':[row], 'selected':None, 'reason':'待验证', 'issues':[]})

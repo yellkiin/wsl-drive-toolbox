@@ -16,6 +16,15 @@ def candidate(port=18567, address='127.0.0.1', pid=123, app='SakuraCat'):
 
 
 class SelectionTests(unittest.TestCase):
+    def test_default_user_queries_effective_login_without_selecting_an_account(self):
+        with mock.patch.object(proxy, '_run', return_value='sam\n') as run:
+            self.assertEqual(proxy.default_user('Example'), 'sam')
+        run.assert_called_once_with(['wsl.exe', '--distribution', 'Example', '--exec', 'id', '-un'])
+
+    def test_unknown_default_user_leaves_manual_selection_available(self):
+        with mock.patch.object(proxy, '_run', side_effect=RuntimeError('unavailable')):
+            self.assertEqual(proxy.default_user('Example'), '')
+
     def test_unique_candidate_selects_without_system_proxy(self):
         row = candidate()
         selected, _ = proxy.select_candidate([row], {'enabled': False})
